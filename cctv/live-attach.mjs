@@ -1,0 +1,325 @@
+// One viewer's live video: a /live socket, or one channel of a page's /live-mux socket (live-mux.mjs),
+// which behaves as a socket of its own. The rights first, then the NVR, then the channel; then the
+// path its frames take: the main stream as a stand-in for a cold sub-stream (sub-bridge.mjs), the
+// frame rate a remote viewer's link can carry (adaptive-live.mjs), the shared thinned stream for a
+// phone asking for 15 fps (phone-live.mjs), an H.265 stream converted to H.264 for a PC on the
+// local network whose browser cannot play it (h264-fallback.mjs), or else the camera's stream itself. A refusal closes it
+// with the code a /live socket has always had; on a channel that is an "end" message, and the page's
+// other tiles carry on. One that is let in is tracked (access-watch.mjs) for as long as it is open, so
+// losing the live right to that camera, the account or the session ends it too.
+// A camera an admin set to "Steady picture" (steady.mjs) goes another way before all of those: every
+// viewer of it, whatever it asked for, gets the camera's one shared steadied stream, while there is room.
+// Live HD (rights.mjs) decides every main-stream picture here: the main stream asked for directly
+// (refused 1008 'hd not allowed' without it), and the main stream standing in for a sub-stream that
+// has no picture yet (none without it: the viewer is told why it waits instead, live-wait.mjs).
+//
+// Out of server.mjs so the tests can drive every refusal and path (importing server.mjs starts the
+// NVRs); server.mjs hands in what it owns.
+import { createHash } from 'node:crypto'
+import { isRemoteAddress } from './adaptive-live.mjs'
+import { deviceOf } from './device-name.mjs'
+import { waitForSub } from './live-wait.mjs'
+import { makeMainLimit } from './main-limit.mjs'
+import { isPhoneRequest } from './phone-live.mjs'
+import { HD_NOT_ALLOWED } from './stream-param.mjs'
+import { noteNotSteady } from './steady.mjs'
+import { bridgeSub } from './sub-bridge.mjs'
+import { CODEC_H265 } from './transcode.mjs'
+
+// Conversions a phone's stand-in leaves free, for full-size views (phone-live.mjs caps them at 16)
+export const PHONE_SPARE = 4
+// An H.265 main standing in for a browser without H.265 sends nothing and ends at once, and the tile,
+// with no picture, asks again every 8-16 s: 14-16 held tiles on depot were about 2 lines a second
+// for as long as the owner's page was open (review of 29 Sep). Its line is said once in this long for
+// the same camera and viewer, with how many were left out.
+export const H265_QUIET_MS = 10 * 60_000
+// Who asked for a camera in full quality (its main stream) is said in the journal: a main stream is
+// several times a sub-stream's load on the NVR and the server, and on 2026-10-13 nothing said who
+// had opened the ones that were running. Once in this long for the same viewer and camera: a
+// full-size view that reconnects, or a wall asking again, is one line.
+export const FULL_QUALITY_QUIET_MS = 60_000
+
+/**
+ * Whether to say now that this viewer opened this camera in full quality: true the first time, and
+ * again once everyMs has passed since it was last said.
+ * @param {{ everyMs?: number, now?: () => number }} [o]
+ * @returns {(viewer: string, camera: string) => boolean}
+ */
+export function fullQualityGate({ everyMs = FULL_QUALITY_QUIET_MS, now = Date.now } = {}) {
+  const said = new Map() // viewer and camera -> when it was last said
+  return (viewer, camera) => {
+    const t = now()
+    const key = `${viewer}|${camera}`
+    const at = said.get(key)
+    if (at !== undefined && t - at < everyMs) return false
+    for (const [k, v] of said) if (t - v >= everyMs) said.delete(k) // (past their quiet: of no more use)
+    said.set(key, t)
+    return true
+  }
+}
+
+/** The line itself: "[live] ann (Windows PC · Chrome 141, local 192.168.1.20) opened full quality nvr1/4". */
+export const fullQualityLine = ({ user, device, remote, address, camera }) =>
+  `[live] ${user || 'someone'} (${device || 'unknown device'}, ${remote ? 'remote' : 'local'} ${address || 'address unknown'}) opened full quality ${camera}`
+
+/** One key per browser, from the upgrade request: a page's /live and /live-mux sockets are one viewer. */
+export const viewerOf = (req, currentUser) => createHash('sha1').update(`${currentUser(req) ?? '?'}|${req.headers['user-agent'] ?? ''}|${req.headers.cookie ?? ''}`).digest('hex')
+
+/**
+ * What stands in for a sub-stream that is not running (sub-bridge.mjs): the camera's main stream,
+ * or, for a phone that cannot play the H.265 it is, that main as converted for phones (the tile
+ * would get nothing: 09-27, depot's tiles held at its sub-stream limit stayed dark on a phone
+ * while full screen, the same main converted, played). Only for a sub-stream held at the NVR's
+ * limit, which may wait minutes: a cold one comes in about 2 s, less than a conversion takes to
+ * start, and a phone scrolling a list would start one per tile. Only onto a main that already
+ * plays, and only while the conversions leave PHONE_SPARE free. Its conversion is its own, and asks
+ * for the main in the background, as the plain stand-in does: the NVR worker joins a main that
+ * plays for it and never starts or keeps one for it (nvr-worker.mjs bridgeOnly). (A full-size
+ * phone view of the same camera has the foreground one: two conversions in that rare case.)
+ */
+function standIn(nvr, ch, main, { phone, held, clientH265, phoneLive }) {
+  const h265 = nvr.codecSeen?.get?.(`${ch}:0`)?.codec === 'h265'
+  if (!phone || !held || clientH265 || !h265 || !nvr.mainPlaying?.(ch)) return main
+  const key = `${nvr.id}/${ch}/0/standin`
+  if (!phoneLive.has?.(key) && !(phoneLive.room?.() >= PHONE_SPARE)) return main
+  return { gop: main.gop, add: (tap) => phoneLive.attach(key, main, 0, tap, { background: true, camera: `${nvr.id}/${ch + 1}` }), remove: (tap) => phoneLive.detach(key, tap) }
+}
+
+/**
+ * The stand-in as the access watch sees it (access-watch.mjs): Live HD taken away ends the main
+ * stream's pictures on this socket and nothing else; the viewer stays on its own sub-stream and, while
+ * that has no picture yet, is told why it waits from then on (wait: live-wait.mjs; the bridge's send
+ * passes straight through once it has ended). It leaves the watch when the socket closes.
+ */
+const standInHandle = (ws, bridge, wait) => ({
+  readyState: 1,
+  on: (event, fn) => ws.on?.(event, fn),
+  close: () => {
+    bridge.end('rights')
+    wait()
+  }
+})
+
+/**
+ * @param {{ can: Function, currentUser: (req: object) => string|null, isAdmin?: (user: string) => boolean,
+ *   adaptiveLive: { attach: Function }, phoneLive: { attach: Function }, h264Fallback?: { enabled: boolean, mainEnabled?: boolean, attach: Function }|null, track?: Function,
+ *   waitTimers?: { every?: Function, clear?: Function, now?: () => number },
+ *   log?: (line: string) => void, now?: () => number }} o
+ *   can: rights.mjs can; currentUser: the request's signed-in user; isAdmin: the account's role now
+ *   (without it, the `who` a socket was let in with, for the same user); track: access-watch.mjs's,
+ *   which asks the rights again while the socket or channel is open; waitTimers: live-wait.mjs's timers
+ *   (tests); log: the stand-ins' lines; now: the clock (tests); h264Fallback: the conversions for local
+ *   PCs without H.265 (h264-fallback.mjs), none without it; clientAddress (in o): the visitor's own
+ *   address for a request (server.mjs clientIp), for the line that says who opened full quality;
+ *   mainLimit (in o): the per-recorder limit on cameras in full quality (main-limit.mjs; tests hand one in)
+ *   steady (in o): the steadied cameras' shared streams (steady.mjs SteadyLive), none without it
+ * @returns {(ws: object, req: object, o: { nvr: object, who: object, ch: number, streamType: number,
+ *   clientH265: boolean, noH265?: boolean, phone15: boolean }) => void} attachLive
+ *   clientH265: the page said its browser plays H.265 (h265=1); noH265: it said it does not (h265=0).
+ *   Neither: it did not say (an older page, or one that does not know yet), which is not "cannot"
+ */
+export function liveAttacher({ can, currentUser, isAdmin = null, adaptiveLive, phoneLive, h264Fallback = null, track = () => {}, waitTimers = {}, log = (line) => console.log(line), now = Date.now, clientAddress = (req) => req.socket?.remoteAddress, mainLimit = makeMainLimit({ now, log }), steady = null }) {
+  const sayFullQuality = fullQualityGate({ now })
+  const quiet = new Map() // camera and viewer -> { at, left }: its H.265 stand-in line last said, and those left out since
+  /** The H.265 stand-in line for a camera and viewer, or null when it was said less than H265_QUIET_MS ago. */
+  const h265Line = (line, key) => {
+    const t = now()
+    const q = quiet.get(key)
+    if (q && t - q.at < H265_QUIET_MS) {
+      q.left++
+      return null
+    }
+    for (const [k, v] of quiet) if (t - v.at >= H265_QUIET_MS) quiet.delete(k) // (past their quiet: of no more use)
+    quiet.set(key, { at: t, left: 0 })
+    return `${line}; said once in ${H265_QUIET_MS / 60_000} min for this camera and viewer${q?.left ? `, ${q.left} left out since the last` : ''}`
+  }
+  return function attachLive(ws, req, { nvr, who, ch, streamType, clientH265, noH265 = false, phone15 }) {
+    if (!can(who, 'live', { nvr: nvr.id, ch })) return ws.close(1008, 'not allowed')
+    // live video: with a live worker, the worker's own login decides (it polls the camera list)
+    if (!nvr.liveOnline) {
+      ws.close(1013, 'NVR offline')
+      return
+    }
+    if (!Number.isInteger(ch) || ch < 0 || ![0, 1].includes(streamType)) {
+      ws.close(1008, 'bad channel or stream')
+      return
+    }
+    // Live HD: the main stream is full quality -- and so is anything that is not the sub-stream. Its
+    // own reason, so the page drops to the sub-stream instead of asking again.
+    const hd = () => can(who, 'live-hd', { nvr: nvr.id, ch })
+    if (streamType !== 1 && !hd()) return ws.close(1008, HD_NOT_ALLOWED)
+    // Steady picture (steady.mjs): a camera an admin switched it on for is steadied on the server, for
+    // every viewer -- local or remote, PC or phone, a grid tile or the full-size view. A main stream
+    // asked for is steadied in full quality when there is room (below); otherwise it gets the steadied
+    // sub-stream, and none of the main stream's own path below applies: no full-quality line, only the
+    // live right watched for as it plays. Not for a
+    // sub-stream the NVR holds back at its limit (nothing to steady until there is room: as it was).
+    // Past the cap, or a conversion that failed: the camera's own stream as below, its tile told why
+    // first (before anything else is sent). Every socket is noted (watch) so that switching the setting
+    // moves it at once. None of this may cost the video: if it throws, the normal path.
+    if (steady?.enabled) {
+      const key = `${nvr.id}/${ch}`
+      try {
+        steady.watch(key, ws)
+        // Full quality asked for (2026-10-16, Mike: "it wont load the main stream"): the main stream
+        // steadied, 1920 wide, within the recorder's full-quality limit and Steady picture's own cap
+        // for full quality. Refused by either, or failed: the steadied standard picture, as before.
+        if (streamType === 0 && steady.wants(key)) {
+          let room = false
+          try {
+            room = mainLimit.ask(nvr, ch, ws) === true
+          } catch {}
+          if (room) {
+            const got = steady.attach(key, nvr.getStream(ch, 0), ws, { camera: `${nvr.id}/${ch + 1}`, main: true })
+            if (got === true) {
+              ws.on?.('close', () => {
+                try {
+                  mainLimit.leave(ws)
+                } catch {}
+              })
+              track(ws, req, { actions: ['live', 'live-hd'], nvr: nvr.id, ch })
+              return
+            }
+            try {
+              mainLimit.leave(ws)
+            } catch {}
+          }
+        }
+        if (steady.wants(key) && nvr.subHeld?.(ch) !== true) {
+          const got = steady.attach(key, nvr.getStream(ch, 1), ws, { camera: `${nvr.id}/${ch + 1}` })
+          if (got === true) {
+            track(ws, req, { actions: ['live'], nvr: nvr.id, ch })
+            return
+          }
+          noteNotSteady(ws, got)
+        }
+      } catch (e) {
+        log(`[steady] ${nvr.id}/${ch + 1}: ${e?.message ?? e}; the camera's own stream`)
+      }
+    }
+    // Full quality is limited per recorder (main-limit.mjs): seven main streams asked of a P2P recorder
+    // at once (2026-10-13) had it drop its links again and again. A new camera past the limit is refused
+    // with MAIN_AT_LIMIT, which the page takes as "the standard picture for now" (live-tile.js), never
+    // as an error; a camera already in full quality for someone is always joined. Counted until this
+    // socket or channel closes. The bookkeeping must not cost the video: if it fails, the main is let in.
+    if (streamType === 0) {
+      let got = true
+      try {
+        got = mainLimit.ask(nvr, ch, ws)
+      } catch {}
+      if (got !== true) return ws.close(1013, got)
+      ws.on?.('close', () => {
+        try {
+          mainLimit.leave(ws)
+        } catch {}
+      })
+    }
+    // let in: the same question again for as long as it is open, from the session as it is then.
+    // Every path below (sub-bridge, adaptive, phone, the stream itself) ends with this socket or
+    // channel closing, which is how it leaves the watch.
+    track(ws, req, { actions: streamType === 1 ? ['live'] : ['live', 'live-hd'], nvr: nvr.id, ch })
+    // The main stream asked for and let in: who, from what and where (FULL_QUALITY_QUIET_MS). Only a
+    // viewer's own request comes this way: the recorder's streams, the warm-ups and a main standing
+    // in for a cold sub-stream (below) never do. The line is for people; it must not cost the video
+    if (streamType === 0) {
+      try {
+        const camera = `${nvr.id}/${ch + 1}`
+        if (sayFullQuality(viewerOf(req, currentUser), camera)) {
+          log(fullQualityLine({ user: who?.user ?? currentUser(req), device: deviceOf(req.headers?.['user-agent']), remote: isRemoteAddress(req.socket?.remoteAddress), address: clientAddress(req), camera }))
+        }
+      } catch {}
+    }
+    const stream = nvr.getStream(ch, streamType)
+    const remote = isRemoteAddress(req.socket.remoteAddress)
+    const phone = !remote && phone15 && isPhoneRequest(req.headers)
+    // held back at the NVR's sub-stream limit (nvrs.mjs subHeld): no picture of its own until there
+    // is room. A tile's first request is not in the worker's list yet: with the NVR at its limit, a
+    // sub-stream not running yet will be held (subFull)
+    const held = streamType === 1 && (nvr.subHeld?.(ch) === true || (!(stream.gop?.length > 0) && nvr.subFull?.() === true))
+    // A sub-stream that is not running yet (cold, refused by the NVR, or held at its limit): the
+    // camera's main stream meanwhile, until the sub-stream's own first frame (sub-bridge.mjs). Those
+    // are main-stream pictures -- a full-resolution keyframe even for two seconds -- so only with
+    // Live HD, and watched for it apart from the socket. Without it the main stream is not even asked
+    // for (asking starts it), and the tile is told why it waits (live-wait.mjs): held when the NVR
+    // holds this sub-stream back (or, for the first notice, is at its limit: the `held` above), counted
+    // from now.
+    // A stand-in's start and end are logged with the camera and whether the viewer is remote: on 29
+    // Sep a remote page's stand-ins could only be guessed from the code (stutter report 2.6, verify-6).
+    // The H.265 one that sends nothing, once in H265_QUIET_MS for the camera and viewer. A remote
+    // viewer's is the main stream's keyframes only, as its page has room (sub-bridge.mjs).
+    const since = (waitTimers.now ?? Date.now)()
+    const wait = () => waitForSub(ws, { stream, held: () => nvr.subHeld?.(ch) === true, full: () => nvr.subFull?.() === true, since, ...waitTimers })
+    if (streamType === 1 && !(stream.gop?.length > 0)) {
+      if (hd()) {
+        const main = nvr.getStream(ch, 0)
+        const stand = standIn(nvr, ch, main, { phone, held, clientH265, phoneLive })
+        const tag = `[sub-bridge] ${nvr.id}/${ch + 1}, ${remote ? 'remote' : 'local'} viewer${held ? ", sub-stream held at the NVR's limit" : ''}${stand !== main ? ', main converted for a phone' : ''}:`
+        const say = (line, why) => {
+          const text = why === 'h265' ? h265Line(line, `${nvr.id}/${ch}|${viewerOf(req, currentUser)}`) : line
+          if (text) log(`${tag} ${text}`)
+        }
+        const bridge = bridgeSub(ws, { sub: stream, main: stand, clientH265, remote, log: say })
+        if (bridge) track(standInHandle(ws, bridge, wait), req, { actions: ['live', 'live-hd'], nvr: nvr.id, ch })
+      } else {
+        wait()
+      }
+    }
+    // a remote viewer (through Tailscale): the frame rate its link and the uplink can carry, per
+    // browser (viewerOf). With the codec the NVR saw on this stream: a main started on demand has no
+    // keyframe yet, and its first one, H.265, must not go to a browser that cannot decode it
+    // (adaptive-live.mjs #h265). A main is moved between streams there at its level changes (the
+    // camera's own, level full's conversion, another viewer's): each move asks Live HD again first
+    // (mayMain), from the session and the account's role as they are then, as the access watch asks,
+    // never the `who` above (a demoted admin's); not allowed, it answers with the watch's reason
+    if (remote) {
+      const codec = nvr.codecSeen?.get?.(`${ch}:${streamType}`)?.codec
+      const mayMain = streamType !== 0 ? undefined : () => {
+        const user = currentUser(req)
+        if (!user) return 'signed out'
+        const as = { user, admin: isAdmin ? isAdmin(user) === true : user === who.user && who.admin === true }
+        if (can(as, 'live', { nvr: nvr.id, ch }) !== true) return 'not allowed'
+        return can(as, 'live-hd', { nvr: nvr.id, ch }) === true || HD_NOT_ALLOWED
+      }
+      adaptiveLive.attach(viewerOf(req, currentUser), { ws, nvrId: nvr.id, ch, type: streamType, source: stream, clientH265, codec, mayMain })
+      return
+    }
+    // a phone asking for 15 fps gets the shared thinned stream (phone-live.mjs), when there is room.
+    // Not a held sub-stream: it has nothing to thin until there is room (small then: sent as it is),
+    // and a conversion place held open for it is one its stand-in may need -- unless it is H.265,
+    // which a phone may not play as it is (a sub tile that cannot decode its stream closes for good)
+    const subH265 = nvr.codecSeen?.get?.(`${ch}:1`)?.codec === 'h265'
+    if (phone && (!held || subH265) && phoneLive.attach(`${nvr.id}/${ch}/${streamType}`, stream, streamType, ws, { camera: `${nvr.id}/${ch + 1}` })) return
+    // A PC on the local network whose page said its browser cannot play H.265 (h265=0: never one that
+    // only did not say), on an H.265 sub-stream: the shared H.264 conversion of it (h264-fallback.mjs).
+    // Not a remote viewer or a phone, which went their own ways above and keep them; not a main stream
+    // (converted below, on a budget of its own); not an H.264 camera, ever. The codec is the one on the stream's
+    // own last keyframe, or with none yet, what the NVR last saw it send. Not known at all: the
+    // camera's own stream, as before, and the tile asks again when an H.265 keyframe reaches it
+    // (live-tile.js), by which time that keyframe is here to say. No room, or a conversion that
+    // failed: closed with the reason, which the tile shows instead of sitting black on H.265.
+    if (noH265 && !phone && streamType === 1 && h264Fallback?.enabled) {
+      const key = stream.gop?.[0]
+      if (key ? key[1] === CODEC_H265 : subH265) {
+        const got = h264Fallback.attach(`${nvr.id}/${ch}/1`, stream, ws, { camera: `${nvr.id}/${ch + 1}` })
+        if (got !== true) ws.close(1013, got)
+        return
+      }
+    }
+    // The same PC asking for an H.265 main stream (its full-size view): the shared H.264 conversion of
+    // that, scaled to at most 1920 wide, on the main streams' own small budget (h264-fallback.mjs
+    // KINDS.main). The same conditions and the same rule for the codec; an H.264 main, or one not known
+    // yet, is the camera's own as before. No room, or a conversion that failed: closed with the reason
+    // (a main's "no room" is its own), and the full-size view stays on its sub-stream (viewer.js). With
+    // that budget at nothing (mainEnabled false) none of this happens: a main stream is as it was.
+    if (noH265 && !phone && streamType === 0 && h264Fallback?.mainEnabled) {
+      const key = stream.gop?.[0]
+      if (key ? key[1] === CODEC_H265 : nvr.codecSeen?.get?.(`${ch}:0`)?.codec === 'h265') {
+        const got = h264Fallback.attach(`${nvr.id}/${ch}/0`, stream, ws, { camera: `${nvr.id}/${ch + 1}`, kind: 'main' })
+        if (got !== true) ws.close(1013, got)
+        return
+      }
+    }
+    stream.add(ws)
+    ws.on('close', () => stream.remove(ws))
+  }
+}

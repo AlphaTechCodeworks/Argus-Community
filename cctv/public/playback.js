@@ -1,0 +1,3429 @@
+// Recorded playback: day timeline + one player fed by /playback.
+// Times are UTC epoch ms (the NVR stamps recordings in UTC). They are shown in
+// the NVR's local time, the time printed on the picture, by adding the NVR's
+// time-zone offset (state.tz) and formatting with getUTC*().
+//
+// Two modes, chosen per camera and day (pb-sources.js pickMode, plan R6):
+//  - server: the server's own recordings (admins, CCTV_LIVE_WORKER=on, footage that day, a codec
+//    this browser decodes). Everything is in the SERVER's clock. The day's timeline comes from the
+//    database in one request (/api/playback/timeline). The NVR's /recordings is asked in the
+//    background, never waited for, for its events and for stretches only the NVR has (drawn in
+//    --tl-nvr, converted to server time with -skewMs); a busy or offline NVR is retried quietly.
+//    One socket (src=auto) per camera: seeks and scrubs go over it as {seek|scrub: T, gen}; binary
+//    frames count only after {type:'started'|'scrub'} of the newest gen. The preroll (the frames
+//    from the keyframe before T) is skipped by the player, its keyframe shown at once as a poster.
+//    Speeds -32x..32x: reverse and 8x+ are keyframes, reverse shown as stills. Dragging the
+//    playhead scrubs (one scrub in flight, pb-sources.js ScrubThrottle); releasing plays.
+//    A frame step ({step: 1|-1, from, gen}, one in flight) is answered with {type:'step'} and the
+//    frames from the keyframe to the one wanted: only that one is drawn, and the page stays paused.
+//    Today the file being written counts as recorded up to the live edge (pb-sources.js liveEdge:
+//    the timeline's now plus the time since, less 1 s); later times are not recorded yet, as in
+//    NVR mode, and a scrub stops at the edge.
+//    A remote viewer (the tunnel or the tailnet; the server decides and says so with {type:'fit'})
+//    is sent a copy converted to fit the link, "HD (server, light)"; "Original (server)" asks for
+//    the recording itself (&original=1, pb-sources.js serverQualityOptions).
+//  - nvr: the NVR's playback exactly as before (NVR clock, no src parameter, speeds 1-8, SD/HD).
+// Switching between them (quality "SD (NVR)", or a camera or day in the other mode) converts the
+// position by the NVR's clock skew.
+import { CODEC_H265, VideoPlayer, canDecodeH265 } from './player.js'
+import { mountCameraBrowser, workspaceSite } from './camera-browser.js'
+import { cameraChoices, cameraKey, cameraLabel, mountCameraFinder, readLastCamera, saveLastCamera, startCamera } from './pb-picker.js'
+import { preferencesReady } from './user-settings.js'
+import { PLAYBACK_CLOCK, REMOTE_PLAYBACK_CLOCK } from './playout.js'
+import { soundOut } from './live-audio.js'
+import { SOUND_CODEC, soundDelayS, soundWanted } from './pb-sound.js'
+import { startTelemetry } from './telemetry.js'
+import { attachZoom } from './pinch-zoom.js'
+import {
+  MESSAGE_STICKY_MS,
+  NvrFallback,
+  PLAYBACK_STALL_MS,
+  RECONNECT_MESSAGE,
+  SERVER_START_TIMEOUT_MS,
+  ScrubThrottle,
+  convertTime,
+  describeSkew,
+  fitChange,
+  nvrFitChange,
+  gapAt,
+  liveEdge,
+  mergeSources,
+  nextStretch,
+  nvrQualityOptions,
+  nvrRetryDelay,
+  pbRights,
+  pickMode,
+  prerollUntil,
+  qualityForCam,
+  reconnectOnClose,
+  recordedFrom as stretchFrom,
+  refusedMessage,
+  scrubTimeoutMs,
+  serverFailed,
+  serverQualityOptions,
+  serverSocketQuery,
+  shift,
+  speedFor,
+  waitingText,
+  watchesStart
+} from './pb-sources.js'
+import { MAX_BOXES, boxSeekMs, follow as followView, fmtClock, laneBoxes, makeView, panBy, ticks, zoomAt } from './pb-view.js'
+import { SEQUENCE_TOLERANCE_MS, canReverse, liveHref, pillText, recordingEnd, recordingStart, sequenceTarget, sliderIndex, sliderSpeed, sliderSpeeds, spanWords, speedText } from './pb-bar.js'
+import { bookmarkMarkers, canEdit, checkBookmark, filterBookmarks, sortBookmarks, spanText } from './bookmarks-view.js'
+import { allowedSpeeds, clampSpeed, frameStep, ignoredRepeat, shuttleLabel, shuttleRate, stepNotBefore } from './pb-transport.js'
+import { DEFAULT_OSD, drawOsd, osdFont, osdIsOff, osdLayout } from './osd-overlay.js'
+
+// The site last worked in (camera-browser.js workspaceSite) comes with the account, and decides
+// which camera opens: this page's own script waits here until the preferences are known
+// (user-settings.js, which may not wait itself).
+await preferencesReady
+
+// Video is decoded here in the browser, exactly as the camera encoded it; the
+// server never converts it. Recordings in H.265 need a browser/PC that can decode H.265.
+const H265_HELP =
+  // The old wording blamed the graphics card and told people to find another PC. That is usually
+  // wrong and sends them off to solve the wrong problem: on Windows the commonest cause by far is
+  // that the machine has no H.265 decoder installed at all, whatever its graphics card can do.
+  // Windows does not ship one, because the codec is licensed -- a brand new laptop with a good GPU
+  // fails exactly like an old one until the extension is added, and then works immediately.
+  'This recording is H.265, which this browser cannot play.\n\n' +
+  'On Windows this is usually a missing codec rather than a slow machine: Chrome and Edge need the "HEVC Video Extensions" from the Microsoft Store, which Windows does not include. Installing it normally fixes this straight away, whatever graphics card you have.\n\n' +
+  'Otherwise: open it in Chrome or Edge on a machine that has H.265 (Safari on a Mac plays it without anything extra), or set this camera to record in H.264 on the NVR.'
+
+const HEADER_SIZE = 16
+const DAY = 86_400_000
+// The timeline is drawn from ordinary elements rather than a canvas, so every box can carry its own
+// title and click. That only stays cheap because nothing outside the view is drawn (laneBoxes clips
+// it, and folds boxes of a kind that meet on screen into one) and each lane is capped (MAX_BOXES,
+// pb-view.js): a day of one-second motion events would otherwise be tens of thousands.
+const MIN_SPAN = 10_000
+const SEEK_STEP = 30_000
+const START_BACK_MS = 5 * 60_000
+// server recordings: the file being written is readable, so playback starts closer to now
+const START_BACK_SERVER_MS = 60_000
+const PLAYHEAD_GRAB_PX = 8 // pressing this close to the playhead scrubs (server mode) instead of panning
+const NOTICE_MS = 5000
+
+const $ = (id) => document.getElementById(id)
+const cameraSel = $('camera')
+const dateInput = $('date')
+const playBtn = $('play')
+const qualitySel = $('quality')
+const clockEl = $('clock')
+const clockInput = $('clockInput')
+const messageEl = $('message')
+const noticeEl = $('pbNotice')
+const badgeEl = $('srcBadge')
+const remoteMarkEl = $('remoteMark') // the server calls this viewer remote ({type:'fit'}): shown then (F1/F6)
+const skewEl = $('skewHint')
+const legendServer = $('legendServer')
+const hintEl = $('pbHint')
+const videoEl = $('video')
+const spinnerEl = $('spinner')
+const placeholderEl = $('pbPlaceholder') // the quiet mark in the picture until the first frame
+const timeline = $('timeline')
+const laneRec = $('laneRec')
+const laneMotion = $('laneMotion')
+const ticksEl = $('ticks')
+const playheadEl = $('playhead')
+const rulerHeadEl = $('rulerHead') // the playhead's line carried up through the ruler, to the pill
+const pillEl = $('pill') // the day and time under the playhead
+const liveLink = $('liveLink')
+const playBackBtn = $('playBack')
+const speedSlider = $('speedSlider')
+const speedTextEl = $('speedText')
+const nowEl = $('tlNow')
+const hoverLine = $('hoverLine')
+const hoverLabel = $('hoverLabel')
+const overview = $('overview')
+const ovBoxes = $('ovBoxes')
+const ovWindow = $('ovWindow')
+const ovNow = $('ovNow')
+const speedsEl = $('speeds')
+const spanEl = $('spanLabel')
+const followBtn = $('followBtn')
+const shuttleEl = $('shuttle')
+const shuttleLabelEl = $('shuttleLabel')
+const shortcutsDlg = $('shortcuts')
+const zoomBtns = [...document.querySelectorAll('.pb-zoom button')]
+
+const pad = (n) => String(n).padStart(2, '0')
+const local = (ms) => new Date(ms + state.tz) // NVR local wall time, read with getUTC*()
+const fmtTime = (ms) => {
+  const d = local(ms)
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`
+}
+const fmtDate = (ms) => {
+  const d = local(ms)
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`
+}
+/** Start of an NVR-local day (YYYY-MM-DD), as UTC ms. */
+const dayStartOf = (date) => Date.parse(`${date}T00:00:00Z`) - state.tz
+/** A day kept between the first recorded day and today (the NVR's today). YYYY-MM-DD compares as text. */
+function clampDay(day) {
+  const max = fmtDate(state.nvrNow)
+  if (day > max) return max
+  if (dateInput.min && day < dateInput.min) return dateInput.min
+  return day
+}
+/** ‹ › for the day: › stops at today, ‹ at the first recorded day. */
+function updateDayArrows() {
+  const next = document.getElementById('dayNext')
+  const prev = document.getElementById('dayPrev')
+  if (next) next.disabled = Boolean(state.date) && state.date >= fmtDate(state.nvrNow)
+  if (prev) prev.disabled = Boolean(state.date && dateInput.min) && state.date <= dateInput.min
+}
+
+const state = {
+  nvr: null, // NVR id
+  ch: null,
+  date: null,
+  ranges: [], // [[start, end]] (server mode: the server's)
+  events: [], // [[start, end, type]]
+  hits: [], // motion-search results: { start, end, score }
+  position: null, // ms of the frame on screen (NVR clock; server mode: server clock)
+  requested: null, // ms we last asked to play from
+  paused: false,
+  speed: 1,
+  stream: 1,
+  nvrMain: false, // the NVR session said it plays its main stream ({type:'stream'}: a camera kept only in HD)
+  h265: true, // this browser can decode H.265 (checked at start)
+  // the window on the day (pb-view.js): absolute ms, always valid, always replaced rather than edited
+  view: makeView({ dayStartMs: 0, dayEndMs: DAY, spanMs: DAY, minSpanMs: MIN_SPAN }),
+  follow: true, // keep the playhead on screen while it plays; panning switches it off
+  nvrNow: Date.now(),
+  tz: 0, // NVR time-zone offset in ms (local - UTC)
+  clockOf: null, // the NVR whose clock (nvrNow, tz) was read
+  // ---- playback from the server's recordings ----
+  mode: 'nvr', // 'server' | 'nvr' for the camera and day shown
+  avail: false, // the server has recordings of this camera (the timeline is available)
+  // with avail: 'server' (HD from the server), 'original' (a remote viewer chose the recording itself
+  // over the copy made to fit the link) or 'sd-nvr' (the viewer chose the NVR's SD)
+  quality: 'server',
+  remote: false, // the server converts this viewer's playback to fit a remote link ({type:'fit'} came)
+  fit: null, // what the server last said of that: 'on', 'busy', 'fits' or 'original' (pb-sources.js fitChange)
+  nvrFit: null, // the same of the NVR's own HD recording (NVR mode; pb-sources.js nvrFitChange)
+  skew: 0, // the NVR's clock - the server's (ms)
+  firstMs: null, // the camera's oldest server recording
+  gaps: [], // server mode: recorder gaps [[start, end, reason]]
+  nvrRaw: null, // server mode: the NVR's { ranges, events } for the day, in NVR time
+  live: false, // server mode: the last range is the file being written (it grows up to the live edge, edgeNow())
+  tlAt: 0, // server mode: performance.now() when the timeline giving nvrNow came (for the live edge)
+  stretches: [], // server mode: [{ s, e, src }] the server's ranges and the NVR-only stretches
+  src: null // what plays in server mode: 'server' or 'nvr' (a stretch the server lacks)
+}
+
+// This viewer's playback cameras, each with what it may play (/api/cameras?for=playback: sd, hd,
+// nvrHd, legs; pb-sources.js pbRights), and the rights of the camera shown now. The page offers only
+// what the server will play; the server decides again every time.
+let playbackCams = []
+const rightsNow = () => pbRights(playbackCams.find((c) => c.nvr === state.nvr && c.ch === state.ch))
+
+let ws = null
+let showStats = false
+let scrub = null // { t } while the playhead is dragged (server mode)
+let stepHold = false // a frame step's seek is playing: its first picture pauses it (stepFrame; the NVR's playback)
+let knownFps = { cam: null, fps: 0 } // the camera's frame rate as last measured while it played (it reads 0 while paused)
+let seekAt = null // performance.now() of the last seek, until its first picture (D overlay)
+let startMs = null // seek to first picture, ms
+// seeks only: this page has no live tiles to sample (telemetry.js)
+const telemetry = startTelemetry({ page: 'playback', tiles: () => [] })
+let lastEndSkip = -Infinity // the last stretch jumped to at an end (never the same one twice)
+let hoverX = null // where the pointer is over the timeline, in px from its left edge
+let drag = null // { x, startMs, moved, box } while the timeline is being panned
+// What a click on a motion box plays from, by the box's element: set as the lane is drawn, read on
+// pointerup. A map rather than a data attribute because the answer depends on where on the box the
+// click lands (boxSeekMs): one box can stand for an hour of events.
+const boxSeek = new WeakMap()
+
+const player = new VideoPlayer(videoEl.querySelector('canvas'), {
+  clock: PLAYBACK_CLOCK,
+  onResourceLimit: () => {
+    showMessage('Device video limit. Select a lighter recording source.')
+    if (ws) { ws.onclose = null; ws.close(); ws = null }
+    player.reset()
+  },
+  onError: () => showMessage('Video restarted. Seek to retry.'),
+  onFrame: (ts) => {
+    if (!scrub) state.position = ts // (while scrubbing the playhead follows the pointer)
+    sound.shown = { ts, at: performance.now() } // the picture's clock, which the sound keeps to
+    soundQuietCheck()
+    if (ws?.stepGen != null) ws.stepGen = null // a server step's frame is on screen: the next may go
+    const fpsNow = Number(player.stats?.fps)
+    if (fpsNow > 0) knownFps = { cam: camKey(), fps: fpsNow }
+    if (stepHold && !scrub) {
+      // the picture a frame step asked for: hold it
+      stepHold = false
+      if (ws && !state.paused) togglePause()
+    }
+    noteStart()
+    notePlaybackFrame() // a frame arrived: not waiting; re-arm the "nothing is arriving" watch
+    hideMessage()
+    scheduleDraw()
+  },
+  onPoster: () => noteStart(),
+  onUnsupported: (codecId) => {
+    showMessage(codecId === CODEC_H265 ? H265_HELP : 'This browser cannot decode this video.')
+    // nothing to show: stop pulling footage from the NVR
+    if (ws) {
+      ws.onclose = null
+      ws.close()
+      ws = null
+    }
+  }
+})
+
+/** The first picture after a seek (a poster or a frame): the D overlay's start time. */
+function noteStart() {
+  spinnerEl.hidden = true // the first picture is here: whatever we were waiting for has arrived
+  placeholderEl.hidden = true
+  if (seekAt === null) return
+  startMs = Math.round(performance.now() - seekAt)
+  // (how long a seek takes, for the baseline nobody had: telemetry.mjs 'seek-picture')
+  telemetry.event('seek-picture', { nvr: state.nvr, ch: state.ch, ms: startMs })
+  seekAt = null
+}
+
+/** The spinner while there is nothing to show yet: seeking, another camera, another quality. */
+function showSpinner() {
+  spinnerEl.hidden = false
+}
+
+// A message shown mid-play (the server waiting, a reconnect) stays at least MESSAGE_STICKY_MS: without
+// this the next buffered frame's onFrame -> hideMessage wiped it before it could be read (F5).
+let messageStickyUntil = 0
+function showMessage(text, { sticky = false } = {}) {
+  messageEl.textContent = text
+  messageEl.hidden = false
+  if (sticky) messageStickyUntil = performance.now() + MESSAGE_STICKY_MS
+}
+function hideMessage() {
+  if (performance.now() < messageStickyUntil) return
+  if (!messageEl.hidden) messageEl.hidden = true
+}
+
+/** A short note over the top of the picture that fades (skipped stretches, speed changes). */
+let noticeTimer = null
+function showNotice(text) {
+  noticeEl.textContent = text
+  noticeEl.hidden = false
+  noticeEl.classList.remove('fading')
+  clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => {
+    noticeEl.classList.add('fading')
+    noticeTimer = setTimeout(() => (noticeEl.hidden = true), 600)
+  }, NOTICE_MS)
+}
+
+// ---- "nothing is arriving" (playback hunt F5) ----------------------------
+// The server says {type:'waiting', why} when its pacer has had nothing to send for 2 s while playing,
+// and {type:'playing'} before it goes on. The page also watches for itself (an older server, or the
+// socket stalled): PLAYBACK_STALL_MS with no frame while playing shows the same spinner and message.
+let stallTimer = null
+let waiting = false
+/** A frame (or a {type:'next'}) arrived: clear any waiting state and re-arm the watch for `ms`. */
+function notePlaybackFrame(ms = PLAYBACK_STALL_MS) {
+  clearTimeout(stallTimer)
+  if (waiting) {
+    waiting = false
+    if (!state.paused) hideMessage()
+  }
+  if (!state.paused && !scrub) stallTimer = setTimeout(() => showWaiting(), ms)
+}
+/** Shows the spinner and a message while playback waits (the server's reason, or a plain fallback). */
+function showWaiting(why) {
+  clearTimeout(stallTimer)
+  if (state.paused) return // nothing is meant to arrive while paused: that is not waiting
+  waiting = true
+  showSpinner()
+  showMessage(waitingText(why), { sticky: true })
+}
+/** Stops the watch (paused, scrubbing, ended, the socket gone). */
+function stopStallWatch() {
+  clearTimeout(stallTimer)
+  stallTimer = null
+  waiting = false
+}
+
+// ---- data ---------------------------------------------------------------
+
+/** Query-string prefix naming the current NVR. */
+const nvrQ = () => `nvr=${encodeURIComponent(state.nvr)}`
+const camKey = () => `${state.nvr}/${state.ch}`
+
+async function api(path) {
+  const res = await fetch(path)
+  if (res.status === 401) location.href = '/login.html'
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    const e = new Error(body.error ?? `HTTP ${res.status}`)
+    e.status = res.status
+    if (body.retryAfterS > 0) e.retryAfterS = body.retryAfterS // the NVR is busy for a moment
+    throw e
+  }
+  return body
+}
+
+// While an NVR is busy (recovering, or its calls came back late) the server answers the timeline
+// requests at once with 503 and retryAfterS rather than queue more work for it. The page shows
+// the message and loads again then; choosing another camera or day meanwhile replaces that retry.
+let busyTimer = null
+/** true if e says the NVR is busy: shows its message and runs again() after its retryAfterS. */
+function retryWhenFree(e, again) {
+  if (!e?.retryAfterS) return false
+  showMessage(e.message)
+  clearTimeout(busyTimer)
+  busyTimer = setTimeout(again, e.retryAfterS * 1000)
+  return true
+}
+
+// The server's timeline of a camera's day: one database request, never the NVR (rec-api.mjs).
+// An answer is reused briefly (the start and loadDay ask for the same day); "not available" is
+// per camera (flag off, not allowed, no recordings) and reused for any day for a minute.
+let tlCache = null // { key, cam, at, body }
+const TL_REUSE_MS = 5000
+const TL_OFF_REUSE_MS = 60_000
+
+async function fetchTimeline({ fresh = false } = {}) {
+  const from = Math.round(dayStartOf(state.date))
+  const key = `${camKey()}/${from}`
+  const c = tlCache
+  if (!fresh && c && c.cam === camKey()) {
+    const age = performance.now() - c.at
+    if (c.body.available ? c.key === key && age < TL_REUSE_MS : age < TL_OFF_REUSE_MS) return c.body
+  }
+  let body
+  try {
+    body = await api(`/api/playback/timeline?${nvrQ()}&ch=${state.ch}&from=${from}&to=${from + DAY}`)
+  } catch {
+    body = { available: false } // (the page works as before without it)
+  }
+  body.receivedAt = performance.now() // when body.now was read (a reused answer keeps it: the live edge)
+  tlCache = { key, cam: camKey(), at: body.receivedAt, body }
+  return body
+}
+
+let dayToken = 0 // a newer camera or day replaces what an older load would still do
+let lastPick = null // the mode chosen for the day shown, and why (pb-sources.js pickMode)
+
+/**
+ * Loads the chosen day, then runs after(). The server's recordings first (one database request):
+ * with them (pickMode) the day plays from the server; otherwise exactly as before: the NVR's
+ * clock if needed, then its recordings.
+ */
+async function loadDay(after, tzRetried = false) {
+  clearTimeout(busyTimer)
+  clearTimeout(nvrSideTimer)
+  const token = ++dayToken
+  state.ranges = []
+  state.events = []
+  state.gaps = []
+  state.nvrRaw = null
+  state.stretches = []
+  drawTimeline()
+  const tl = await fetchTimeline()
+  if (token !== dayToken) return
+  state.avail = tl.available === true
+  if (state.avail && Number.isFinite(tl.tzOffsetMs) && tl.tzOffsetMs !== state.tz && !tzRetried) {
+    // the NVR's time zone differs from the one assumed: the day starts elsewhere
+    state.tz = tl.tzOffsetMs
+    return loadDay(after, true)
+  }
+  const pick = pickMode({ timeline: tl, h265: state.h265, quality: qualityForCam(camKey(), state.quality, nvrFallback.used), rights: rightsNow() })
+  lastPick = pick
+  if (pick.mode === 'none') {
+    // without Playback SD a day the server has nothing of has nothing to play (the NVR is not asked)
+    leaveServerMode()
+    showMessage(pick.why)
+    drawTimeline()
+    return after?.()
+  }
+  if (pick.mode === 'server') {
+    // Said once per day loaded: the picture is a conversion, not the recording itself, and a viewer
+    // comparing it with the original later deserves to know that.
+    if (pick.transcode) showNotice(pick.why)
+    return enterServerDay(tl, token, after)
+  }
+  leaveServerMode()
+  if (state.avail && /H\.265/.test(pick.why)) showNotice(pick.why)
+  try {
+    // another NVR has its own clock and recording days
+    if (state.clockOf !== state.nvr) {
+      const busy = await loadNvrInfo()
+      if (busy) throw busy
+    }
+    const { ranges, events } = await api(`/api/playback/recordings?${nvrQ()}&ch=${state.ch}&date=${state.date}`)
+    state.ranges = ranges
+    state.events = events
+    if (ranges.length === 0) showMessage('No recordings for this camera on this day.')
+  } catch (e) {
+    if (retryWhenFree(e, () => loadDay(after))) {
+      // what still plays is another camera or day: stop it, so the message stays up
+      if (ws) {
+        ws.onclose = null
+        ws.close()
+        ws = null
+      }
+      return
+    }
+    showMessage(`Could not load recordings: ${e.message}`)
+    // nothing to seek in: after() only put "No recording after this point." over the real reason
+    // (2026-10-20, F2a-playback-page#0)
+    drawTimeline()
+    return
+  }
+  drawTimeline()
+  after?.()
+}
+
+/** First recorded moment at or after t (or null). */
+function recordedFrom(t) {
+  for (const [s, e] of state.ranges) {
+    if (t < s) return s
+    if (t <= e) return t
+  }
+  return null
+}
+
+// ---- server mode: the day -----------------------------------------------------
+
+function enterServerDay(tl, token, after) {
+  state.mode = 'server'
+  state.clockOf = null // NVR mode reads the NVR's clock again (nvrNow is the server's here)
+  if (ws && ws.kind !== 'server') closeSocket()
+  state.nvrNow = tl.now
+  state.tlAt = tl.receivedAt ?? performance.now()
+  if (Number.isFinite(tl.tzOffsetMs)) state.tz = tl.tzOffsetMs
+  state.skew = tl.skewMs ?? 0
+  state.firstMs = tl.firstMs ?? null
+  state.ranges = tl.ranges
+  state.live = reachesNow(tl)
+  state.gaps = tl.gaps ?? []
+  state.speed = speedFor('server', state.speed)
+  rebuildStretches()
+  dateInput.max = fmtDate(state.nvrNow)
+  updateDayArrows()
+  updateDateMin()
+  updateModeUi()
+  drawTimeline()
+  loadNvrSide(token)
+  after?.()
+}
+
+/** Back to NVR playback (nothing changes when the page is in NVR mode already). */
+function leaveServerMode() {
+  if (state.mode === 'server') {
+    state.mode = 'nvr'
+    if (ws?.kind === 'server') closeSocket()
+    throttle.cancel()
+    player.setStills(false)
+    state.src = null
+    state.speed = speedFor('nvr', state.speed)
+    player.setRate(state.speed)
+  }
+  updateModeUi()
+}
+
+/**
+ * The NVR's ranges and events in server time, and the stretches only the NVR has. The file being
+ * written keeps growing after the timeline was read: when the server's last range reaches `now`,
+ * it counts as recorded up to the live edge as it is now (edgeNow), never later: a time after the
+ * edge is not recorded yet (serverSeek rebuilds the stretches first, so the edge is current).
+ */
+function rebuildStretches() {
+  const raw = state.nvrRaw
+  if (state.mode === 'server') state.events = raw ? shift(raw.events, -state.skew) : []
+  state.stretches = mergeSources(state.ranges, raw ? shift(raw.ranges, -state.skew) : [], { liveTo: state.live ? edgeNow() : null })
+}
+
+/** Whether the timeline's last range is the file being written (it ends at the timeline's now). */
+const reachesNow = (tl) => Boolean(tl.ranges?.length) && tl.ranges.at(-1)[1] >= tl.now - 2000
+
+/** Server mode, today: the newest moment the server has on disk (pb-sources.js liveEdge). */
+const edgeNow = () => liveEdge(state.nvrNow, state.tlAt, performance.now())
+
+let nvrSideTimer = null
+let nvrInfo = null // { nvr, dates } the NVR's recording days (server mode)
+let nvrRetryToken = null // the loadNvrSide token the refusal backoff below belongs to
+let nvrRefusalMs = null // pb-sources.js nvrRetryDelay's backoff so far; null before a refusal
+
+/**
+ * Server mode, in the background: the NVR's clock (skew, time zone) and recording days, then its
+ * recordings of the day (events, NVR-only stretches). Never waited for; a busy or offline NVR is
+ * retried quietly (no message over the video). A refused search (dc9e296: a channel the NVR always
+ * declines, or a broken file walk) is not "busy for a moment": it backs off instead of asking again
+ * every 30 s (pb-sources.js nvrRetryDelay), starting over on a new camera or day, or once a search
+ * succeeds.
+ */
+async function loadNvrSide(token) {
+  clearTimeout(nvrSideTimer)
+  // without Playback SD the NVR is not this viewer's to ask (its clock, days and recordings): the
+  // timeline's own time zone and skew are used, and there is no NVR-only stretch to draw
+  if (!rightsNow().sd) return
+  if (token !== nvrRetryToken) {
+    nvrRetryToken = token
+    nvrRefusalMs = null // a different camera or day: an earlier refusal's backoff does not carry over
+  }
+  const stale = () => token !== dayToken || state.mode !== 'server'
+  const nvr = state.nvr
+  try {
+    if (nvrInfo?.nvr !== nvr) {
+      const [clock, dates] = await Promise.all([api(`/api/playback/now?${nvrQ()}`), api(`/api/playback/dates?${nvrQ()}`)])
+      if (state.nvr !== nvr) return
+      nvrInfo = { nvr, dates: Array.isArray(dates) ? dates : [] }
+      if (stale()) return
+      state.skew = clock.skewMs ?? state.skew
+      if (Number.isFinite(clock.tzOffsetMs) && clock.tzOffsetMs !== state.tz) {
+        // the day starts elsewhere in this time zone: load it again
+        state.tz = clock.tzOffsetMs
+        return loadDay(() => {})
+      }
+      updateDateMin()
+      updateModeUi()
+    }
+    const { ranges, events } = await api(`/api/playback/recordings?${nvrQ()}&ch=${state.ch}&date=${state.date}`)
+    if (stale()) return
+    nvrRefusalMs = null // the search succeeded: forget any earlier refusal's backoff
+    state.nvrRaw = { ranges, events }
+    rebuildStretches()
+    scheduleDraw()
+  } catch (e) {
+    if (stale()) return
+    // 403: this user may play the server's copy but not the NVR's (rights.mjs), so there is no NVR
+    // side to show; asking again would only be refused again
+    if (e.status === 403) return
+    const { delayMs, refusalMs } = nvrRetryDelay(e, nvrRefusalMs)
+    nvrRefusalMs = refusalMs
+    nvrSideTimer = setTimeout(() => {
+      if (!stale()) loadNvrSide(token)
+    }, delayMs)
+  }
+}
+
+/** The date picker goes back to the older of the server's first recording and the NVR's first day. */
+function updateDateMin() {
+  const days = [state.firstMs !== null ? fmtDate(state.firstMs) : null, nvrInfo?.nvr === state.nvr ? nvrInfo.dates[0] : null].filter(Boolean).sort()
+  dateInput.min = days[0] ?? ''
+}
+
+/** Today's timeline in server mode, every minute (the database only). */
+async function refreshServer() {
+  const token = dayToken
+  const tl = await fetchTimeline({ fresh: true })
+  if (token !== dayToken || state.mode !== 'server' || !tl.available) return
+  state.nvrNow = tl.now
+  state.tlAt = tl.receivedAt ?? performance.now()
+  state.skew = tl.skewMs ?? state.skew
+  state.ranges = tl.ranges
+  state.live = reachesNow(tl)
+  state.gaps = tl.gaps ?? []
+  dateInput.max = fmtDate(state.nvrNow)
+  updateDayArrows()
+  rebuildStretches()
+  updateModeUi()
+  scheduleDraw()
+  if (state.date === fmtDate(state.nvrNow)) loadNvrSide(token) // today's NVR events grow too
+}
+
+// ---- controls per mode ----------------------------------------------------------
+
+const speedLabel = (s) => `${s < 0 ? '−' : ''}${Math.abs(s)}×`
+
+function setOptions(sel, list, value) {
+  sel.replaceChildren(...list.map(([v, label]) => new Option(label, String(v))))
+  sel.value = String(value)
+}
+
+/**
+ * The speed buttons for the mode shown (pb-transport allowedSpeeds: the server's whole ladder, the
+ * NVR's 1-8 forward). Rebuilt only when the mode changes; otherwise just the pressed one moves.
+ */
+function renderSpeeds() {
+  if (speedsEl.dataset.kind !== state.mode) {
+    speedsEl.replaceChildren(
+      ...allowedSpeeds(state.mode).map((s) => {
+        const b = document.createElement('button')
+        b.type = 'button'
+        b.textContent = speedLabel(s)
+        b.dataset.speed = String(s)
+        b.addEventListener('click', () => setSpeed(s))
+        return b
+      })
+    )
+    speedsEl.dataset.kind = state.mode
+  }
+  for (const b of speedsEl.children) b.setAttribute('aria-pressed', String(Number(b.dataset.speed) === state.speed))
+  // the slider on the bar: one stop for each forward speed this source plays (pb-bar.js
+  // sliderSpeeds), so it cannot be left between two, and the speed chosen in words beside it
+  const allowed = allowedSpeeds(state.mode)
+  speedSlider.max = String(Math.max(0, sliderSpeeds(allowed).length - 1))
+  speedSlider.value = String(sliderIndex(state.speed, allowed))
+  speedSlider.setAttribute('aria-valuetext', speedText(state.speed))
+  speedTextEl.textContent = speedText(state.speed)
+  updatePlayButton()
+}
+
+// The speed slider says how fast; the two play buttons say which way. So a speed picked while the
+// footage runs backwards stays backwards.
+speedSlider.addEventListener('input', () => {
+  setSpeed(sliderSpeed(Number(speedSlider.value), allowedSpeeds(state.mode), state.speed < 0 ? -1 : 1))
+})
+
+/** One stop slower (-1) or faster (+1) on the slider; nothing at either end. */
+function stepSpeed(by) {
+  const allowed = allowedSpeeds(state.mode)
+  setSpeed(sliderSpeed(sliderIndex(state.speed, allowed) + by, allowed, state.speed < 0 ? -1 : 1))
+}
+
+/**
+ * Whether Play backwards is offered. Only the server's own recordings can be played backwards
+ * (rec-playback.mjs sends them keyframe by keyframe, shown as a run of stills); the NVR's playback
+ * has no reverse at all, in NVR mode or over a stretch of the day only the NVR has. The button is
+ * hidden there rather than left to do something else.
+ */
+const reverseOffered = () => canReverse(allowedSpeeds(state.mode)) && !(state.mode === 'server' && state.src === 'nvr')
+
+/**
+ * Play in `direction` (1 forwards, -1 backwards) at the speed the slider shows; pressed while it
+ * already plays that way, pause. Changing direction while it plays carries straight on the other way.
+ */
+function playToward(direction) {
+  const playing = !state.paused && Boolean(ws)
+  const sameWay = (state.speed < 0 ? -1 : 1) === direction
+  if (playing && sameWay) return togglePause()
+  if (!sameWay) {
+    const allowed = allowedSpeeds(state.mode)
+    setSpeed(sliderSpeed(sliderIndex(state.speed, allowed), allowed, direction))
+  }
+  if (!playing) togglePause()
+}
+
+// More: the controls used now and then, one click away. It floats beside its button, so it closes
+// the way a menu does: Escape, a click anywhere else, or More again. Bookmarks closes it too, since
+// the panel it opens is what you want to see next.
+const moreBtn = $('moreBtn')
+const moreEl = $('pbMore')
+function setMore(open) {
+  moreEl.hidden = !open
+  moreBtn.setAttribute('aria-expanded', String(open))
+}
+moreBtn.addEventListener('click', () => setMore(moreEl.hidden))
+$('bookmark').addEventListener('click', () => setMore(false))
+document.addEventListener('pointerdown', (e) => {
+  if (!moreEl.hidden && !moreEl.contains(e.target) && !moreBtn.contains(e.target)) setMore(false)
+})
+// (capture: ahead of everything else. Escape always shuts the menu; when the keyboard is in the menu
+// or on its button that is all it does, but a box elsewhere with its own Escape, such as the time box
+// or the camera finder's list, still gets it, so one press is enough there too)
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || moreEl.hidden) return
+  const focus = document.activeElement
+  const inside = moreEl.contains(focus)
+  if (inside || focus === moreBtn || !focus || focus === document.body) e.stopPropagation()
+  setMore(false)
+  if (inside) moreBtn.focus()
+}, true)
+
+// ---- Sound: the camera's microphone as it was recorded (NVR playback) ----------------------
+// The server sends it down the playback socket with the picture once asked ({sound: true}), at 1x
+// forwards only (cctv/pb-sound.mjs); it plays through live-audio.js soundOut, with the volume and
+// Filter of Live's Sound button and the same kept choices (argus.sound). Each packet is played when its
+// picture is on screen (pb-sound.js soundDelayS). The button's choice stays through a change of camera
+// or time; pausing or another speed silences it until 1x plays again. Off when the page opens: a
+// browser starts sound only from a click.
+const SOUND_PREFS_KEY = 'argus.sound'
+const soundPrefs = (() => {
+  try {
+    const p = JSON.parse(localStorage.getItem(SOUND_PREFS_KEY) ?? '{}')
+    return { volume: Number.isFinite(p.volume) ? Math.min(2, Math.max(0, p.volume)) : 1, filter: p.filter === true }
+  } catch {
+    return { volume: 1, filter: false }
+  }
+})()
+const saveSoundPrefs = () => { try { localStorage.setItem(SOUND_PREFS_KEY, JSON.stringify(soundPrefs)) } catch {} }
+// on: the button; out: the speaker (soundOut), made at the first click; format: what the socket said
+// its sound is ({type:'sound'}); shown: the picture's clock; heard: a packet played since the sound was
+// last asked for, and since when it was asked (soundQuietCheck)
+const sound = { on: false, out: null, format: null, shown: null, heard: false, askedAt: 0 }
+const soundBtn = $('soundBtn')
+const soundCap = soundBtn.querySelector('.pb-cap')
+const soundExtras = $('soundExtras')
+// the small speaker on the bar: the same switch as the Sound button in More, so sound that is on can
+// be seen (and turned off) without opening the menu
+const soundQuick = $('soundQuick')
+soundQuick.addEventListener('click', () => soundBtn.click())
+const soundVol = $('soundVol')
+const soundFilter = $('soundFilter')
+soundVol.value = String(soundPrefs.volume)
+soundVol.addEventListener('input', () => { soundPrefs.volume = Number(soundVol.value); sound.out?.setVolume(soundPrefs.volume); saveSoundPrefs() })
+const showSoundFilter = () => { soundFilter.classList.toggle('on', soundPrefs.filter); soundFilter.setAttribute('aria-pressed', String(soundPrefs.filter)) }
+showSoundFilter()
+soundFilter.addEventListener('click', () => { soundPrefs.filter = !soundPrefs.filter; sound.out?.setFilter(soundPrefs.filter); showSoundFilter(); saveSoundPrefs() })
+
+/** The button's words, as Live's: Sound, Sound…, Sound on, No sound yet, No sound. */
+function showSound(text, title) {
+  soundCap.textContent = text
+  soundBtn.title = title
+  soundBtn.setAttribute('aria-pressed', String(sound.on))
+  soundQuick.setAttribute('aria-pressed', String(sound.on))
+  soundQuick.title = title
+  soundExtras.hidden = !sound.on
+}
+
+const soundNow = () => soundWanted({ on: sound.on, mode: state.mode, speed: state.speed, paused: state.paused, stepping: stepHold })
+
+/**
+ * Tells the open socket whether to send sound, when that has changed (each socket starts without), and
+ * silences what is scheduled when it is no longer wanted. Called wherever play, pause, speed, a step or
+ * the mode change.
+ */
+function syncSound() {
+  const want = soundNow()
+  if (!want) sound.out?.silence()
+  if (ws?.kind === 'nvr' && ws.readyState === WebSocket.OPEN && Boolean(ws.soundAsked) !== want) {
+    ws.soundAsked = want
+    ws.send(JSON.stringify({ sound: want }))
+    if (want) {
+      sound.heard = false
+      sound.askedAt = performance.now()
+    }
+  }
+  if (!sound.on) return
+  if (state.speed !== 1) showSound('Sound on', 'Sound plays at normal speed (1×) only. Click to stop.')
+  else if (sound.heard) showSound('Sound on', 'Listening to this recording. Click to stop.')
+}
+
+/** Nothing heard 6 s after asking while the picture plays: this camera recorded no sound here. */
+function soundQuietCheck() {
+  if (!sound.on || sound.heard || soundCap.textContent === 'No sound' || !ws?.soundAsked || performance.now() - sound.askedAt < 6000) return
+  if (soundCap.textContent !== 'No sound yet') showSound('No sound yet', 'No sound is coming from this recording.')
+}
+
+/** One sound frame from the socket (codec byte SOUND_CODEC): played with its picture, or dropped. */
+function playSound(buf, view) {
+  if (!sound.on || !sound.out || !sound.format || !soundNow()) return
+  const delay = soundDelayS({ tsMs: Number(view.getBigInt64(8, true)) / 1000, shown: sound.shown, nowMs: performance.now() })
+  if (delay === null) return
+  if (!sound.out.play(buf.subarray(HEADER_SIZE), sound.format, delay) || sound.heard) return
+  sound.heard = true
+  showSound('Sound on', 'Listening to this recording. Click to stop.')
+}
+
+/** A new playback socket (another camera or moment): the old position's sound is not heard over the new one, and the new socket says its own format. */
+function soundNewSocket() {
+  sound.out?.silence()
+  sound.shown = null
+  sound.format = null
+  sound.heard = false
+  if (sound.on) showSound('Sound…', 'Waiting for the recording\'s sound')
+}
+
+/** {type:'sound'}: the format of the sound frames that follow, or why there are none. */
+function onSoundFormat(msg) {
+  sound.format = msg.format ? msg : null
+  if (!msg.format && sound.on) showSound('No sound', msg.why ?? 'This recording has no sound.')
+}
+
+soundBtn.addEventListener('click', () => {
+  sound.on = !sound.on
+  if (sound.on) {
+    // (made here, from the click: a browser starts sound only then)
+    sound.out ??= soundOut({ volume: soundPrefs.volume, filter: soundPrefs.filter })
+    if (!sound.out) {
+      sound.on = false
+      showSound('No sound', 'This browser cannot play sound here.')
+      return
+    }
+    showSound('Sound…', 'Waiting for the recording\'s sound')
+  } else {
+    showSound('Sound', 'Listen to this camera\'s microphone as it was recorded')
+  }
+  syncSound()
+})
+showSound('Sound', 'Listen to this camera\'s microphone as it was recorded')
+
+/** Speeds, quality choices, legend, skew hint and source badge for the mode shown. */
+function updateModeUi() {
+  const server = state.mode === 'server'
+  renderSpeeds()
+  // quality: with server recordings "HD (server)" or "SD (NVR)", and for a remote viewer "HD (server,
+  // light)", "Original (server)" or "SD (NVR)" (pb-sources.js serverQualityOptions); otherwise the
+  // NVR's SD or HD as before
+  // this camera's quality: the viewer's own choice, unless it fell back to the NVR on its own (pb-sources.js qualityForCam)
+  const quality = qualityForCam(camKey(), state.quality, nvrFallback.used)
+  const r = rightsNow()
+  const kind = state.avail && (server || quality === 'sd-nvr') ? (state.remote ? 'server-remote' : 'server') : 'nvr'
+  // rebuilt when the camera's rights change too (another camera, or the list read again)
+  const sig = `${kind}|${r.sd}|${r.nvrHd}`
+  if (qualitySel.dataset.sig !== sig) {
+    if (kind !== 'nvr') setOptions(qualitySel, serverQualityOptions({ remote: state.remote, sd: r.sd }), server ? 'server' : 'sd-nvr')
+    else setOptions(qualitySel, nvrQualityOptions({ nvrHd: r.nvrHd }), r.nvrHd ? state.stream : 1)
+    qualitySel.dataset.kind = kind
+    qualitySel.dataset.sig = sig
+  }
+  // (NVR mode with no Playback SD is a day with nothing to play: nothing to choose)
+  qualitySel.disabled = kind === 'nvr' && !r.sd
+  if (kind !== 'nvr') {
+    qualitySel.value = !server ? 'sd-nvr' : quality === 'original' && state.remote ? 'original' : 'server'
+    // a camera the NVR records in HD only plays HD for "SD (NVR)" ({type:'stream'})
+    const label = !server && state.nvrMain ? 'HD (NVR)' : 'SD (NVR)'
+    const nvrOpt = [...qualitySel.options].find((o) => o.value === 'sd-nvr')
+    if (nvrOpt && nvrOpt.textContent !== label) nvrOpt.textContent = label
+  }
+  // motion search reads the NVR's copy: only with Playback SD
+  const search = document.getElementById('searchToggle')
+  if (search) search.hidden = !r.sd
+  // Sound comes with the NVR's playback only: the server's own recordings keep none
+  soundBtn.hidden = server
+  soundQuick.hidden = server
+  soundExtras.hidden = server || !sound.on
+  syncSound()
+  legendServer.hidden = !server
+  const hint = server ? describeSkew(state.skew) : ''
+  skewEl.textContent = hint
+  skewEl.hidden = !hint
+  badgeEl.hidden = !(server && state.src === 'nvr')
+  hintEl.textContent = server
+    ? 'Click the timeline to jump · drag the playhead to scrub · scroll to zoom · drag to pan'
+    : 'Click the timeline to jump · scroll to zoom · drag to pan'
+}
+
+function setSource(src) {
+  state.src = src ?? 'server'
+  badgeEl.hidden = !(state.mode === 'server' && state.src === 'nvr')
+  updatePlayButton() // (a stretch from the NVR cannot be played backwards: the button goes with it)
+}
+
+// ---- streaming ------------------------------------------------------------
+
+const rateOf = (speed) => (speed > 0 ? speed : 1) // reverse is shown as stills, not by the clock
+
+function seek(t) {
+  stepHold = false // (stepFrame sets it again after its own seek)
+  if (state.mode === 'server') return serverSeek(t)
+  const target = recordedFrom(t)
+  if (target === null) {
+    showMessage('No recording after this point.')
+    return
+  }
+  state.requested = target
+  state.position = target
+  state.paused = false
+  updatePlayButton()
+  seekAt = performance.now()
+  startMs = null
+  showSpinner()
+  player.reset()
+  player.resume()
+  player.setRate(state.speed)
+  open(target)
+  scheduleDraw()
+}
+
+function open(start) {
+  // a new NVR socket says again what it plays ({type:'stream'}, onStatus); until then the Quality menu
+  // shows what this one asks for, not the "HD" (or "HD (NVR)") an HD-only camera's switch left there:
+  // the next camera played SD under "HD", and choosing "HD" then was no change
+  state.nvrMain = false
+  if (qualitySel.dataset.kind === 'nvr') qualitySel.value = String(rightsNow().nvrHd ? state.stream : 1)
+  else updateModeUi()
+  stopStallWatch() // (the old socket's frames have stopped; the new one's first frame arms it again)
+  if (ws) {
+    ws.onclose = null
+    ws.close()
+  }
+  soundNewSocket()
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const sock = new WebSocket(`${proto}://${location.host}/playback?${nvrQ()}&ch=${state.ch}&stream=${rightsNow().nvrHd ? state.stream : 1}&start=${start}&h265=${state.h265 ? 1 : 0}`)
+  sock.binaryType = 'arraybuffer'
+  sock.kind = 'nvr'
+  sock.onopen = () => {
+    if (state.speed !== 1) sock.send(JSON.stringify({ speed: state.speed }))
+    // paused while it was still connecting: send() drops what an unopened socket cannot take, and
+    // the NVR went on playing behind a page that said it was paused
+    if (state.paused) sock.send(JSON.stringify({ pause: true }))
+    if (ws === sock) syncSound() // (sound, when the button is on and it plays at 1x)
+  }
+  sock.onmessage = (e) => {
+    // a socket the page has let go of (its camera may not be the one shown now), as server sockets do
+    // (2026-10-20, F2a-playback-page#0)
+    if (ws !== sock) return
+    if (typeof e.data === 'string') return onStatus(JSON.parse(e.data))
+    pushFrame(e.data)
+  }
+  sock.onclose = (e) => {
+    if (ws !== sock) return
+    ws = null
+    // the camera taken away or the session signed out while it played (access-watch.mjs)
+    const refused = refusedMessage(e.code, e.reason)
+    if (e.code === 1013) showMessage('The NVR is busy with other playbacks. Try again in a moment.')
+    else if (refused) showMessage(refused)
+  }
+  ws = sock
+}
+
+/** One binary message (the /live wire format) to the player. */
+function pushFrame(data) {
+  const buf = new Uint8Array(data)
+  if (buf.length <= HEADER_SIZE) return
+  const view = new DataView(buf.buffer, buf.byteOffset)
+  if (buf[1] === SOUND_CODEC) return playSound(buf, view) // the camera's sound, not a picture
+  player.push({
+    isKey: (buf[0] & 1) === 1,
+    codecId: buf[1],
+    timestampUs: Number(view.getBigInt64(8, true)),
+    data: buf.subarray(HEADER_SIZE)
+  })
+}
+
+function closeSocket() {
+  stopStallWatch()
+  if (!ws) return
+  settleStart(ws)
+  ws.onclose = null
+  ws.close()
+  ws = null
+}
+
+/**
+ * Another camera is about to be shown: stop the one playing and take its picture off the screen
+ * before the new camera's day loads. A switch used to leave the old socket for the next seek to
+ * replace; when the new camera had nothing to play at that moment the seek gave up, and the old
+ * camera played on under the new camera's name, moving its playhead, and a snapshot saved it with
+ * that name (2026-10-20, F2a-playback-page#0).
+ */
+function leaveCamera() {
+  closeSocket()
+  player.reset()
+  // (reset empties the player but leaves the last picture it drew on the canvas)
+  const c = player.canvas
+  c.getContext('2d').clearRect(0, 0, c.width, c.height)
+  spinnerEl.hidden = true // nothing is coming yet: a seek into the new camera's footage turns it again
+  placeholderEl.hidden = false // the quiet mark, as before a first picture
+}
+
+function onStatus(msg) {
+  if (msg.type === 'error') showMessage(msg.message)
+  if (msg.type === 'sound') onSoundFormat(msg)
+  if (msg.type === 'fit') {
+    // a remote viewer's HD from the NVR (playback.mjs): converted to fit the link, or the NVR's
+    // stream itself for want of a free conversion; said when it changes, not at every seek
+    const change = nvrFitChange(state.nvrFit, msg)
+    state.nvrFit = change.fit
+    if (remoteMarkEl) remoteMarkEl.hidden = false // a remote viewer's NVR HD is fitted too
+    if (change.notice) showNotice(change.notice)
+  }
+  if (msg.type === 'stream') {
+    // this camera records HD only; the server switched over (only for a viewer who may see main). What
+    // plays is shown; the viewer's own choice (state.stream) stays, so the next camera is not asked
+    // for main because this one is HD only
+    state.nvrMain = msg.stream === 0
+    if (qualitySel.dataset.kind !== 'nvr') return updateModeUi() // ("SD (NVR)" chosen: relabelled)
+    const hd = [...qualitySel.options].find((o) => o.value === '0')
+    if (hd) {
+      hd.disabled = false
+      qualitySel.value = '0'
+    }
+  }
+  if (msg.type === 'notice') {
+    // a waiting notice (the NVR not answering, F8) shows a spinner and a message that the next frame
+    // clears; any other notice is a passing toast, as before
+    if (msg.waiting) showWaiting(msg.message)
+    else showNotice(msg.message)
+  }
+  if (msg.type === 'end') {
+    stopStallWatch() // (no more frames are due: "Waiting for the server…" 2 s later was wrong)
+    if (stepHold) {
+      // a frame step ran into the end before its frame came: nothing is playing, and the button says so
+      stepHold = false
+      if (!state.paused) togglePause()
+    }
+    // skip gaps between recordings automatically
+    const next = state.ranges.find(([s]) => s > (state.position ?? 0) + 1000)
+    if (next) seek(next[0])
+    else if (state.nvrNow - (state.position ?? 0) < 3 * 60_000) showMessage('You have reached the newest recording. Use Live for the current picture.')
+    else showMessage('End of recordings.')
+  }
+}
+
+// ---- server mode: the socket ------------------------------------------------------
+
+/**
+ * A seek in server mode: over the open socket ({seek, gen}), or a new socket (src=auto) at T. Today
+ * a time after the live edge is not recorded yet ("No recording after this point.", as in NVR mode):
+ * asked for, the server would announce a future time and the browser would drop every frame.
+ */
+function serverSeek(t) {
+  if (state.live) rebuildStretches() // the live edge as it is now
+  const target = stretchFrom(state.stretches, t)
+  if (target === null) {
+    showMessage('No recording after this point.')
+    return
+  }
+  state.requested = target
+  state.position = target
+  state.paused = false
+  updatePlayButton()
+  throttle.cancel()
+  seekAt = performance.now()
+  startMs = null
+  showSpinner()
+  player.seekReset() // the decoder stays set up
+  if (state.speed > 0) player.setStills(false)
+  player.resume()
+  player.setRate(rateOf(state.speed))
+  // (only a socket that asked for the same: "HD (server, light)" and "Original (server)" differ in
+  // what the server was told when it opened)
+  const sock = ws?.kind === 'server' && ws.cam === camKey() && ws.original === Boolean(lastPick?.original) && ws.readyState <= WebSocket.OPEN ? ws : null
+  if (!sock) openServer(target)
+  else {
+    const cmd = { seek: Math.round(target), gen: ++sock.gen }
+    sock.ackOnFrame = null
+    if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(cmd))
+    else sock.pending = cmd // (sent when it opens)
+    watchStart(sock, cmd.gen, target)
+  }
+  scheduleDraw()
+}
+
+// ---- server mode: the share failing ----------------------------------------------------
+//
+// The server's recordings are on one NAS share. When it is down, a server playback ends with
+// "Playback failed: the recording store could not be read" or, while a read hangs, never starts.
+// The NVR has its own copy, so the page plays that from the same moment instead, once per camera
+// (pb-sources.js NvrFallback): the viewer used to have to find "SD (NVR)" by hand.
+const nvrFallback = new NvrFallback()
+
+/**
+ * Watch generation `gen` (the start, or a seek) of sock: no answer within SERVER_START_TIMEOUT_MS
+ * and the NVR's copy plays instead. Only a start into the server's own footage is watched
+ * (watchesStart): a stretch only the NVR has starts as slowly as the NVR does.
+ */
+function watchStart(sock, gen, target) {
+  settleStart(sock)
+  if (!watchesStart(state.stretches, target)) return
+  sock.startTimer = setTimeout(() => {
+    sock.startTimer = null
+    // answered meanwhile (started, or a newer scrub's reply), or no longer the page's socket
+    if (ws !== sock || sock.okGen >= gen) return
+    const slow = `The server has not started playing after ${SERVER_START_TIMEOUT_MS / 1000} s`
+    // this camera has had its one: say so, and leave the socket be in case the server gets there
+    if (!fallBackToNvr(sock, slow)) showMessage(rightsNow().sd ? `${slow}: its recordings may be unreachable. Choose "SD (NVR)" to play the NVR's copy.` : `${slow}: its recordings may be unreachable.`)
+  }, SERVER_START_TIMEOUT_MS)
+}
+
+/** The start being watched on sock was answered (or the socket is done with): no fallback for it. */
+function settleStart(sock) {
+  clearTimeout(sock?.startTimer)
+  if (sock) sock.startTimer = null
+}
+
+/**
+ * Plays the NVR's own recording from the current position instead of the server's, with a notice:
+ * "SD (NVR)", as the viewer would choose it, so the quality menu says what is playing and "HD
+ * (server)" tries the server again. `why` opens the notice. False (nothing done) when this camera
+ * has had its one already. Only this camera goes over (nvrFallback.take, pb-sources.js): a NAS
+ * outage on one camera used to force every camera opened afterwards onto the NVR too, and kept them
+ * there after the NAS came back.
+ */
+function fallBackToNvr(sock, why) {
+  // the NVR's copy only for someone who may play it (Playback SD); anyone else keeps the server's message
+  if (!rightsNow().sd || !nvrFallback.take(sock.cam)) return false
+  if (ws === sock) closeSocket()
+  else settleStart(sock)
+  state.stream = 1
+  hideMessage() // (the server's "Playback failed: ..." is in the notice instead)
+  showNotice(`${why}. Playing the NVR's copy instead; choose "HD (server)" to try the server again.`)
+  reloadKeepingPosition()
+  return true
+}
+
+function openServer(start, { reconnected = false } = {}) {
+  closeSocket()
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  // server footage is the main stream (stream=0); all times are the server's clock
+  // h265 tells the server what this browser can decode. It is the only thing on the local network
+  // that lets the server convert an H.265 recording to H.264 (transcode.mjs), so a browser there that
+  // can decode H.265 always gets the recording exactly as the camera made it. A remote viewer's
+  // playback is converted to fit the link unless "Original (server)" was chosen (original=1).
+  const original = Boolean(lastPick?.original)
+  const sock = new WebSocket(`${proto}://${location.host}/playback?${nvrQ()}&ch=${state.ch}&stream=0&start=${Math.round(start)}&src=auto&${serverSocketQuery({ h265: state.h265, original })}`)
+  sock.binaryType = 'arraybuffer'
+  sock.kind = 'server'
+  sock.cam = camKey()
+  sock.original = original
+  sock.gen = 0 // the generation asked for last (the start is 0)
+  sock.okGen = -1 // the generation whose frames are shown (announced by started or scrub)
+  sock.pending = null
+  sock.ackOnFrame = null // a scrub's reply came: its keyframe frees the throttle
+  sock.stepGen = null // the generation of a frame step whose frame is not on screen yet (serverStep)
+  sock.stepAt = 0 // ... and when it was sent
+  sock.startTimer = null // watchStart: no answer to the start or a seek yet
+  sock.ended = false // the end of the footage was reached (not a drop to reconnect through)
+  sock.reconnected = reconnected // this socket is itself a reconnect: it does not reconnect again (no loop)
+  sock.onopen = () => {
+    if (state.speed !== 1) sock.send(JSON.stringify({ speed: state.speed }))
+    if (sock.pending) sock.send(JSON.stringify(sock.pending))
+    sock.pending = null
+  }
+  sock.onmessage = (e) => {
+    if (ws !== sock) return
+    if (typeof e.data === 'string') return onServerStatus(sock, JSON.parse(e.data))
+    if (sock.okGen !== sock.gen) return // frames of an older seek or scrub
+    pushFrame(e.data)
+    if (sock.ackOnFrame !== null) {
+      const gen = sock.ackOnFrame
+      sock.ackOnFrame = null
+      throttle.ack(gen)
+    }
+  }
+  sock.onclose = (e) => {
+    if (ws !== sock) return
+    settleStart(sock)
+    stopStallWatch()
+    ws = null
+    // the camera taken away or the session signed out while it played (access-watch.mjs)
+    const refused = refusedMessage(e.code, e.reason)
+    if (e.code === 1013) showMessage('The NVR is busy with other playbacks. Try again in a moment.')
+    else if (refused) showMessage(refused)
+    // a failed server playback (the share down, say): the NVR's copy, once per camera, with the
+    // server's own message ({type:'error'}, just before this) as the notice's reason
+    else if (serverFailed(e.code, e.reason)) fallBackToNvr(sock, (sock.error ?? 'Server playback failed').replace(/[.\s]+$/, ''))
+    // a drop the page did not plan for (1006, or a 1000/1001 while it was still playing): the browser
+    // or the tunnel let go. Reconnect once, at the position reached, rather than sit silent or loop (F5).
+    else if (reconnectOnClose(e.code, e.reason, { playing: sock.okGen >= 0 && !sock.ended, reconnected: sock.reconnected })) {
+      showMessage(RECONNECT_MESSAGE, { sticky: true })
+      openServer(state.position ?? start, { reconnected: true })
+    }
+  }
+  ws = sock
+  watchStart(sock, 0, start)
+}
+
+function onServerStatus(sock, msg) {
+  switch (msg.type) {
+    case 'started': {
+      if (msg.gen !== sock.gen) return
+      sock.okGen = msg.gen
+      sock.ended = false // a fresh start (e.g. a seek past a previous end): a later drop may reconnect
+      settleStart(sock)
+      // a server start at 1x-4x sends the frames from the keyframe before `at` at once (the
+      // preroll): decoded, not shown; its keyframe is the poster. Keyframe starts, reverse and
+      // NVR legs have none (pb-sources.js prerollUntil)
+      const until = prerollUntil(msg)
+      if (until !== null) player.skipUntil(until)
+      if (!scrub) state.position = msg.at
+      setSource(msg.src)
+      scheduleDraw()
+      return
+    }
+    case 'step':
+      if (msg.gen !== sock.gen) return
+      sock.okGen = msg.gen
+      settleStart(sock) // (a start still watched is answered by this too)
+      if (msg.none) {
+        sock.stepGen = null // nothing could be read: the picture stays
+        return
+      }
+      // The frames from the keyframe before it follow at once and then nothing: decoded unseen, and
+      // only the one at `at` is drawn, on a player that stays paused (player.stepTo). Reset here and
+      // not when the step was sent: the frames now coming start at a keyframe.
+      player.seekReset()
+      player.stepTo(msg.at)
+      if (msg.edge !== 'end') sock.ended = false // back from the end of the footage: a later drop may reconnect
+      setSource(msg.src)
+      if (msg.edge) showNotice(msg.edge === 'start' ? 'This is the first recorded frame of this camera.' : 'This is the newest recorded frame.')
+      return
+    case 'scrub':
+      if (msg.gen !== sock.gen) return
+      sock.okGen = msg.gen
+      if (msg.none) throttle.ack(msg.gen) // nothing recorded there: the picture stays
+      else sock.ackOnFrame = msg.gen // its keyframe follows
+      return
+    case 'mode':
+      player.setStills(Boolean(msg.stills))
+      return
+    case 'source':
+      setSource(msg.src)
+      return
+    case 'speed':
+      state.speed = msg.speed
+      renderSpeeds()
+      player.setRate(rateOf(msg.speed))
+      if (msg.reason === 'newest') showNotice('Reached the newest footage: playing at 1×.')
+      scheduleDraw()
+      return
+    case 'notice':
+      showNotice(msg.message)
+      return
+    case 'waiting':
+      // the server's pacer has had nothing to send for 2 s: show the reason, do not keep the stale picture silent
+      showWaiting(msg.why)
+      return
+    case 'playing':
+      // it is sending again: the frame right behind this clears the spinner (notePlaybackFrame)
+      notePlaybackFrame()
+      return
+    case 'next':
+      // a picture is that far off (time-lapse footage): not stalled, just a long gap -- re-arm past it
+      notePlaybackFrame(Number(msg.inMs) + PLAYBACK_STALL_MS)
+      return
+    case 'fit': {
+      // Only a remote viewer is told this (rec-playback.mjs): converted to fit the link, sent the
+      // original for want of a free conversion or because it fits already, or the original as
+      // chosen. The menu then offers "Original (server)"; the notice says what changed, once.
+      const change = fitChange(state.fit, msg)
+      const learned = !state.remote
+      state.remote = true
+      if (remoteMarkEl) remoteMarkEl.hidden = false // the server is treating this viewer as remote
+      state.fit = change.fit
+      // the server treats this viewer as remote: time frames on arrival (a burst after a link pause is
+      // not read as a slow decoder) and, at 1x, grow the buffer with the link (playback hunt F4). Local
+      // playback is untouched; this is idempotent, so a fit at every seek is harmless.
+      player.remotePlayback({ clock: REMOTE_PLAYBACK_CLOCK })
+      if (change.notice) showNotice(change.notice)
+      if (learned) updateModeUi()
+      return
+    }
+    case 'end':
+      settleStart(sock) // (nothing to play there is an answer too)
+      sock.ended = true // a clean end: a close after this is not a drop to reconnect through
+      stopStallWatch()
+      return onServerEnd(msg)
+    case 'error':
+      settleStart(sock) // (the close that follows decides)
+      sock.error = msg.message // (said again if the page goes over to the NVR)
+      showMessage(msg.message)
+      return
+    // 'stream': server footage is the main stream, asked for as such
+  }
+}
+
+function onServerEnd(msg) {
+  if (msg.reverse) {
+    showNotice('Reached the first recording of this camera.')
+    return
+  }
+  // a stretch only the NVR has after the server's footage: play it from there
+  const pos = state.position ?? 0
+  const next = nextStretch(state.stretches, pos + 1000)
+  if (next && next.s > lastEndSkip) {
+    lastEndSkip = next.s
+    return seek(next.s)
+  }
+  if (state.nvrNow - pos < 3 * 60_000) showMessage('You have reached the newest recording. Use Live for the current picture.')
+  else showMessage('End of recordings.')
+}
+
+function send(obj) {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj))
+}
+
+// scrubbing (server mode): one {scrub} in flight, the newest position wins
+const throttle = new ScrubThrottle(
+  (t) => {
+    const sock = ws
+    if (sock?.kind !== 'server' || sock.cam !== camKey() || sock.readyState !== WebSocket.OPEN) return null
+    const gen = ++sock.gen
+    sock.ackOnFrame = null
+    sock.send(JSON.stringify({ scrub: Math.round(t), gen }))
+    return gen
+  },
+  // longer when the server converts this browser's H.265 scrubs, or every scrub of a remote viewer's:
+  // each picture takes 600-830 ms at 4K, and a scrub sent before it is out kills its ffmpeg (asked at
+  // each send: state.h265 and state.fit are known later)
+  { now: () => performance.now(), timeoutMs: () => scrubTimeoutMs(state.h265, state.fit === 'on') }
+)
+
+function togglePause() {
+  stepHold = false // Play or Pause pressed while a frame step was on its way: the viewer's choice stands
+  if (!ws && state.position !== null) return seek(state.position)
+  // Play again at 2x, 4x or 8x from the NVR: asked for again from the moment on screen, not resumed.
+  // A paused NVR playback comes back at about normal speed whatever speed it is given (measured on
+  // the camera wall, 2026-10-07), and the page then waited on frames that came at a quarter of the rate.
+  if (state.paused && state.speed !== 1 && state.mode !== 'server' && ws?.kind === 'nvr' && state.position !== null) return seek(state.position)
+  state.paused = !state.paused
+  send({ pause: state.paused })
+  if (state.paused) {
+    player.pause()
+    // the frames stop because the viewer said so: without this the watch armed by the last frame
+    // put up the spinner and "Waiting for the server…" 2 s into every pause
+    stopStallWatch()
+  } else player.resume()
+  updatePlayButton()
+  syncSound() // (silent while paused)
+}
+
+/**
+ * The two play buttons. The one for the way the footage is running shows Pause while it runs; the
+ * other always offers its own direction. Play backwards is there only when the source can do it.
+ */
+function updatePlayButton() {
+  const back = state.speed < 0
+  const fwdOn = !state.paused && !back
+  const backOn = !state.paused && back
+  playBtn.dataset.state = fwdOn ? 'playing' : 'paused'
+  playBtn.setAttribute('aria-label', fwdOn ? 'Pause' : 'Play')
+  playBtn.title = fwdOn ? 'Pause (Space)' : 'Play (Space)'
+  playBackBtn.hidden = !reverseOffered()
+  playBackBtn.dataset.state = backOn ? 'playing' : 'paused'
+  playBackBtn.setAttribute('aria-label', backOn ? 'Pause' : 'Play backwards')
+  playBackBtn.title = backOn ? 'Pause (Space)' : 'Play backwards, as a run of still pictures (R)'
+}
+
+// The mode we have already explained a clamp for: an NVR leg refuses reverse and anything above 8x,
+// and saying so on every button press would be nagging, so it is said once per mode.
+let clampedFor = null
+
+/**
+ * Play at `speed`, or at the nearest speed this source will actually accept. Every speed bound for a
+ * session goes through clampSpeed, so an NVR leg is never sent one it would refuse and drop.
+ */
+function setSpeed(speed) {
+  const { speed: allowed, changed } = clampSpeed(speed, state.mode)
+  if (changed && clampedFor !== state.mode) {
+    clampedFor = state.mode
+    showNotice(`This camera's NVR cannot play at ${speedLabel(speed)}: playing at ${speedLabel(allowed)}.`)
+  }
+  state.speed = allowed
+  send({ speed: allowed })
+  player.setRate(rateOf(allowed))
+  renderSpeeds()
+  syncSound() // (sound at 1x only)
+  scheduleDraw()
+  return allowed
+}
+
+// A server step not answered within this long no longer holds back the next one.
+const STEP_WAIT_MS = 1000
+
+/**
+ * One frame back or on from the server's recordings: {step, from, gen} on the open socket
+ * (rec-playback.mjs). The server finds the frame next to the one on screen (`from`, its exact time)
+ * and sends it with the frames it decodes from; the page is paused first, so the button says Play
+ * throughout and nothing plays in between. One at a time: a held key repeats faster than a step is
+ * answered, and each new one would drop the one before it unshown (its frames are of an older
+ * generation by then), so the key did nothing until it was let go.
+ */
+function serverStep(sock, direction) {
+  if (sock.stepGen === sock.gen && performance.now() - sock.stepAt < STEP_WAIT_MS) return
+  stepHold = false
+  throttle.cancel()
+  if (!state.paused) {
+    state.paused = true
+    player.pause()
+    stopStallWatch() // (as in togglePause: the frames stop because the viewer said so)
+    updatePlayButton()
+  }
+  const gen = ++sock.gen // (what is still on its way from before the step is dropped, as at a seek)
+  sock.ackOnFrame = null
+  sock.stepGen = gen
+  sock.stepAt = performance.now()
+  sock.send(JSON.stringify({ step: direction < 0 ? -1 : 1, from: state.position, gen }))
+}
+
+/**
+ * One frame back or on, paused where it lands. From the server's recordings the server does it
+ * (serverStep). The NVR's own playback has no such command, in NVR mode or in a stretch of server
+ * mode that plays from the NVR: there the step is a seek to the time one frame away (pb-transport
+ * frameStep) that plays until its first picture, which pauses it (the player's onFrame above): the
+ * frame at or after the target, since the frames before it are the preroll the player skips.
+ * Paused straight after the seek, as this used to do, the clock moved and the picture did not: a
+ * paused playback is sent no frames, and a paused player draws none.
+ */
+function stepFrame(direction) {
+  if (state.position === null) return
+  if (state.mode === 'server' && state.src !== 'nvr' && !scrub && ws?.kind === 'server' && ws.cam === camKey() && ws.readyState === WebSocket.OPEN) return serverStep(ws, direction)
+  // (the rate measured while it last played: paused, the player's own figure is 0, and at an assumed
+  // 25 a back step on a slower camera landed on the frame it left)
+  const fps = Number(player.stats?.fps) > 0 ? Number(player.stats.fps) : knownFps.cam === camKey() && knownFps.fps > 0 ? knownFps.fps : 25
+  const from = state.position
+  const target = frameStep(from / 1000, direction, fps) * 1000
+  seek(target)
+  stepHold = true
+  syncSound() // (none on the way to a stepped frame)
+  // The NVR starts at the keyframe before the time asked for, up to a GOP earlier. Held at its first
+  // picture, a step forward went BACK to that keyframe (2 s, on a camera with a keyframe every 2 s).
+  // The frames up to the one wanted are decoded unseen (player.stepTo, after seek()'s reset): the
+  // picture stays until the frame of the step replaces it, and that frame is the one held.
+  player.stepTo(stepNotBefore(from, direction, fps))
+}
+
+/** What the top lane shows as recorded, for the day on screen: in server mode the NVR-only stretches too. */
+const recordedNow = () => (state.mode === 'server' ? state.stretches : state.ranges)
+
+/**
+ * Previous (-1) or next (+1) sequence: the start of the nearest recorded stretch or motion mark
+ * (a search hit too) that way from the playhead (pb-bar.js sequenceTarget). Going against the way
+ * the footage runs, the mark just jumped to is already behind the playhead by the time of a second
+ * press, the more so the faster it plays: the tolerance grows with the speed, so two presses walk
+ * two marks instead of landing on the same one twice. At the first or the last one the page says
+ * so and stays where it is.
+ */
+function jumpEvent(direction) {
+  const pos = state.position ?? state.view.startMs
+  const against = !state.paused && (state.speed < 0 ? 1 : -1) === direction
+  const target = sequenceTarget({
+    spans: recordedNow(),
+    marks: [...state.events, ...state.hits.map((h) => h.start)],
+    atMs: pos,
+    direction,
+    toleranceMs: SEQUENCE_TOLERANCE_MS * (against ? Math.abs(state.speed) : 1)
+  })
+  if (target === null) {
+    showNotice(direction < 0 ? 'Nothing earlier on this day: this is the first recording or motion.' : 'Nothing later on this day: this is the last recording or motion.')
+    return
+  }
+  ensureVisible(target)
+  seek(target)
+}
+
+/** How far before the end of today's newest recording "go to the newest" starts, as the page does when it opens. */
+const endBackMs = () => (state.date !== fmtDate(state.nvrNow) ? 10_000 : state.mode === 'server' ? START_BACK_SERVER_MS : START_BACK_MS)
+
+/** The first recording of the day shown (-1), or its newest (+1): a little before its end, so it plays. */
+function jumpToEdge(direction) {
+  if (state.mode === 'server' && state.live) rebuildStretches() // the live edge as it is now
+  const target = direction < 0 ? recordingStart(recordedNow()) : recordingEnd(recordedNow(), { backMs: endBackMs() })
+  if (target === null) {
+    showNotice('Nothing is recorded on this day.')
+    return
+  }
+  ensureVisible(target)
+  seek(target)
+}
+
+// ---- timeline -------------------------------------------------------------
+//
+// The timeline is built from ordinary elements, not a canvas: each recorded stretch, gap and motion
+// block is its own div, so it can carry a title the browser shows on hover and be clicked directly.
+// The maths all comes from pb-view.js, which knows nothing about the DOM; this half only positions
+// things as percentages of the track, so a resize needs no redraw.
+
+/**
+ * Replace the view. Every change goes through here, so the day's limits (and the minimum span) are
+ * written down in exactly one place and no caller can leave the window off the end of the day.
+ */
+function setView(v) {
+  const dayStart = dayStartOf(state.date)
+  state.view = makeView({ ...v, minSpanMs: MIN_SPAN, maxSpanMs: DAY, dayStartMs: dayStart, dayEndMs: dayStart + DAY })
+  scheduleDraw()
+}
+
+/** The whole day on screen. */
+const viewWholeDay = () => setView({ startMs: dayStartOf(state.date), spanMs: DAY })
+
+let drawPending = false
+function scheduleDraw() {
+  if (drawPending) return
+  drawPending = true
+  requestAnimationFrame(() => {
+    drawPending = false
+    // follow mode keeps the playhead in sight; pb-view returns the same object when nothing must move
+    if (state.follow && state.position !== null && !scrub && !drag) {
+      const next = followView(state.view, state.position)
+      if (next !== state.view) {
+        const dayStart = dayStartOf(state.date)
+        state.view = makeView({ ...next, minSpanMs: MIN_SPAN, maxSpanMs: DAY, dayStartMs: dayStart, dayEndMs: dayStart + DAY })
+      }
+    }
+    drawTimeline()
+    drawClock()
+  })
+}
+
+/** The big clock (the date box beside it shows the day). Milliseconds only under a two-minute span, where they mean something. */
+function drawClock() {
+  if (!clockInput.hidden) return // the viewer is typing a time: leave the field alone
+  clockEl.textContent = state.position === null
+    ? '--:--:--'
+    : fmtClock(state.position, { ms: state.view.spanMs < 120_000, tzOffsetMs: state.tz })
+}
+
+/**
+ * The stretches for the top lane. In server mode they are split by source — the server's own
+ * footage and the stretches only the NVR has — with the recorder's gaps on top, so a hover says why
+ * nothing was recorded. In NVR mode there is only one source, so it all reads as plain recorded.
+ */
+function recRanges() {
+  if (state.mode !== 'server') return state.ranges.map(([s, e]) => ({ s, e, kind: 'rec' }))
+  const out = state.stretches.map(({ s, e, src }) => ({ s, e, kind: src }))
+  for (const [s, e] of state.gaps) out.push({ s, e, kind: 'gap' })
+  return out
+}
+
+/**
+ * Fill a lane with positioned divs. Only boxes laneBoxes kept (those inside the view, the ones that
+ * meet on screen already folded together) are made, and at most MAX_BOXES of them: a busy day of
+ * motion events would otherwise be tens of thousands of elements, which is the price of leaving the
+ * canvas behind.
+ */
+function fillLane(el, boxes, decorate) {
+  const nodes = boxes.slice(0, MAX_BOXES).map((b) => {
+    const d = document.createElement('div')
+    d.style.left = `${b.leftPct}%`
+    d.style.width = `${b.widthPct}%`
+    d.dataset.kind = b.kind ?? 'rec'
+    decorate?.(d, b)
+    return d
+  })
+  el.replaceChildren(...nodes)
+}
+
+function drawTimeline() {
+  const v = state.view
+  const pct = (t) => ((t - v.startMs) / v.spanMs) * 100
+  const inView = (t) => Number.isFinite(t) && t >= v.startMs && t <= v.endMs
+
+  // a box standing for several (laneBoxes folds those that meet on screen) says so; the reason
+  // shown is the first one's
+  const more = (b, what) => (b.n > 1 ? ` (${b.n} ${what} here: zoom in to see them apart)` : '')
+  fillLane(laneRec, laneBoxes(v, recRanges()), (d, b) => {
+    if (b.kind === 'gap') d.title = `Not recorded: ${gapAt(state.gaps, b.from) ?? 'no reason given'}${more(b, 'holes')}`
+    else d.title = `${fmtTime(b.from)} – ${fmtTime(b.to)}${b.kind === 'nvr' ? ' · from the NVR' : ''}`
+  })
+
+  // the motion lane, with the search's own hits drawn over it; clicking a block plays from it
+  const events = state.events.map(([s, e]) => ({ s, e, kind: 'event' }))
+  const hits = state.hits.map((h) => ({ s: h.start, e: h.end + 2000, kind: 'hit' }))
+  fillLane(laneMotion, [...laneBoxes(v, events), ...laneBoxes(v, hits)], (d, b) => {
+    d.title = `${b.kind === 'hit' ? 'Movement in your box' : 'Motion'} at ${fmtTime(b.from)}${more(b, b.kind === 'hit' ? 'hits' : 'events')}`
+    // the seek happens in the timeline's own pointerup, so a click does not both jump and pan: the
+    // event (or hit) under the pointer from its start, which in a folded box is not the box's first
+    boxSeek.set(d, (t) => boxSeekMs(b, t, b.kind === 'hit' ? hits : events))
+  })
+
+  playheadEl.hidden = state.position === null || !inView(state.position)
+  if (!playheadEl.hidden) playheadEl.style.left = `${pct(state.position)}%`
+  drawPill(playheadEl.hidden ? null : pct(state.position))
+  nowEl.hidden = !inView(state.nvrNow)
+  if (!nowEl.hidden) nowEl.style.left = `${pct(state.nvrNow)}%`
+
+  ticksEl.replaceChildren(
+    ...ticks(v, state.tz).map((t) => {
+      const s = document.createElement('span')
+      s.style.left = `${pct(t.ms)}%`
+      s.textContent = t.label
+      return s
+    })
+  )
+  spanEl.textContent = spanWords(v.spanMs)
+  // Playback | Live: Live opens this same camera, full-size (pb-bar.js liveHref, read by viewer.js)
+  const live = liveHref({ nvr: state.nvr, ch: state.ch })
+  if (liveLink.getAttribute('href') !== live) liveLink.setAttribute('href', live)
+  for (const b of zoomBtns) b.setAttribute('aria-pressed', String(Number(b.dataset.span) === Math.round(v.spanMs)))
+  followBtn.setAttribute('aria-pressed', String(state.follow))
+  drawClip()
+  drawBookmarks()
+  drawOverview()
+  drawHover()
+}
+
+/**
+ * The pill on the playhead, and the line that joins it to the tracks: the day and the time under
+ * the playhead, on the site's own clock (state.tz, as every other time on this page). `at` is the
+ * playhead's place across the view in percent, or null when it is out of sight. The pill is kept
+ * inside the ruler by the style sheet (it stops at either end while its line goes on to the edge).
+ *
+ * Milliseconds are shown only where the time is a frame's own timestamp and can be read: paused on
+ * a frame, or zoomed in under two minutes as the clock does. Never while the playhead is dragged,
+ * when the time is the pointer's and not a frame's.
+ */
+function drawPill(at) {
+  pillEl.hidden = at === null
+  rulerHeadEl.hidden = at === null
+  if (at === null) return
+  const millis = !scrub && (state.paused || state.view.spanMs < 120_000)
+  const text = pillText(state.position, { tzOffsetMs: state.tz, millis })
+  if (pillEl.textContent !== text) pillEl.textContent = text
+  pillEl.classList.toggle('pb-pill-ms', millis)
+  pillEl.style.setProperty('--at', `${at}%`)
+  rulerHeadEl.style.left = `${at}%`
+}
+
+/** The whole day, with the zoomed part marked. Its own view is the day itself, so laneBoxes clips to it. */
+function drawOverview() {
+  const dayStart = dayStartOf(state.date)
+  const day = makeView({ dayStartMs: dayStart, dayEndMs: dayStart + DAY, spanMs: DAY })
+  fillLane(ovBoxes, laneBoxes(day, recRanges().filter((r) => r.kind !== 'gap')))
+  ovWindow.style.left = `${((state.view.startMs - dayStart) / DAY) * 100}%`
+  ovWindow.style.width = `${(state.view.spanMs / DAY) * 100}%`
+  ovNow.hidden = state.nvrNow < dayStart || state.nvrNow > dayStart + DAY
+  if (!ovNow.hidden) ovNow.style.left = `${((state.nvrNow - dayStart) / DAY) * 100}%`
+}
+
+/** The line and label under the pointer: the time there, and in server mode why nothing was recorded. */
+function drawHover() {
+  if (hoverX === null || scrub) {
+    hoverLine.hidden = true
+    hoverLabel.hidden = true
+    return
+  }
+  const w = timeline.clientWidth || 1
+  const t = state.view.startMs + (hoverX / w) * state.view.spanMs
+  const gap = state.mode === 'server' ? gapAt(state.gaps, t) : null
+  hoverLine.hidden = false
+  hoverLabel.hidden = false
+  hoverLine.style.left = `${hoverX}px`
+  hoverLabel.textContent = gap ? `${fmtTime(t)} · not recorded: ${gap}` : fmtTime(t)
+  hoverLabel.style.left = `${Math.min(Math.max(0, hoverX - hoverLabel.offsetWidth / 2), Math.max(0, w - hoverLabel.offsetWidth))}px`
+}
+
+function zoom(factor, anchorMs) {
+  setView(zoomAt(state.view, factor, anchorMs ?? state.position ?? state.view.startMs + state.view.spanMs / 2))
+}
+
+function ensureVisible(t) {
+  if (t < state.view.startMs || t > state.view.endMs) setView({ ...state.view, startMs: t - state.view.spanMs / 2 })
+}
+
+/** Panning is a deliberate look elsewhere, so it drops follow mode; the button puts it back. */
+function setFollow(on) {
+  state.follow = on
+  followBtn.setAttribute('aria-pressed', String(on))
+  scheduleDraw()
+}
+
+const timeAt = (clientX) => {
+  const r = timeline.getBoundingClientRect()
+  return state.view.startMs + ((clientX - r.left) / r.width) * state.view.spanMs
+}
+
+/** Server mode: whether a press at clientX grabs the playhead (within 8 px of it). */
+function onPlayhead(clientX) {
+  if (state.mode !== 'server' || state.position === null) return false
+  const r = timeline.getBoundingClientRect()
+  const px = ((state.position - state.view.startMs) / state.view.spanMs) * r.width
+  return Math.abs(clientX - r.left - px) <= PLAYHEAD_GRAB_PX
+}
+
+// ---- scrubbing (server mode, R10): drag the playhead; releasing plays from there ----
+
+function startScrub(e) {
+  scrub = { t: state.position }
+  throttle.cancel()
+  seekAt = null
+  player.seekReset()
+  player.setStills(true) // each keyframe is shown as soon as it is decoded
+  timeline.classList.add('scrubbing')
+  scrubTo(e.clientX)
+}
+
+function scrubTo(clientX) {
+  const day = dayStartOf(state.date)
+  // today the playhead stops at the live edge: nothing after it is recorded yet
+  const last = state.live ? Math.min(day + DAY, edgeNow()) : day + DAY
+  const t = Math.min(last, Math.max(day, timeAt(clientX)))
+  scrub.t = t
+  state.position = t
+  throttle.push(t)
+  scheduleDraw()
+}
+
+function endScrub() {
+  const t = scrub.t
+  scrub = null
+  throttle.cancel()
+  timeline.classList.remove('scrubbing')
+  seek(t) // plays from there ({seek}; stills off going forward)
+}
+
+// Pinch zoom: two pointers on the track zoom about the point between them. The view they started
+// from is kept, so the zoom follows the fingers exactly instead of compounding on every move.
+const pointers = new Map()
+let pinch = null
+
+const pinchSpread = () => {
+  const [a, b] = [...pointers.values()]
+  return { gap: Math.abs(a.x - b.x), mid: (a.x + b.x) / 2 }
+}
+
+timeline.addEventListener('pointerdown', (e) => {
+  timeline.setPointerCapture(e.pointerId)
+  pointers.set(e.pointerId, { x: e.clientX })
+  if (pointers.size === 2) {
+    if (scrub) endScrub()
+    drag = null
+    const { gap, mid } = pinchSpread()
+    pinch = { gap: Math.max(1, gap), view: state.view, atMs: timeAt(mid) }
+    return
+  }
+  if (pointers.size > 2) return
+  if (onPlayhead(e.clientX)) return startScrub(e)
+  // the box pressed on is noted here: the timeline now has the pointer captured, and captured events
+  // (pointerup included) are aimed at the timeline itself, never at the box under the pointer
+  drag = { x: e.clientX, startMs: state.view.startMs, moved: false, box: e.target }
+})
+
+timeline.addEventListener('pointermove', (e) => {
+  const r = timeline.getBoundingClientRect()
+  hoverX = e.clientX - r.left
+  if (pointers.has(e.pointerId)) pointers.get(e.pointerId).x = e.clientX
+  if (pinch && pointers.size === 2) {
+    const { gap } = pinchSpread()
+    setView(zoomAt(pinch.view, pinch.gap / Math.max(1, gap), pinch.atMs))
+    return
+  }
+  if (scrub) return scrubTo(e.clientX)
+  if (drag) {
+    const dx = e.clientX - drag.x
+    if (Math.abs(dx) > 3) drag.moved = true
+    if (drag.moved) {
+      if (state.follow) setFollow(false)
+      setView({ ...state.view, startMs: drag.startMs - (dx / r.width) * state.view.spanMs })
+      return
+    }
+  }
+  if (!drag) timeline.classList.toggle('on-playhead', onPlayhead(e.clientX))
+  scheduleDraw()
+})
+
+timeline.addEventListener('pointerup', (e) => {
+  pointers.delete(e.pointerId)
+  if (pointers.size < 2) pinch = null
+  if (scrub) return endScrub()
+  if (drag && !drag.moved) {
+    // a motion block pressed on plays the event under the pointer from its start; elsewhere the
+    // time under the pointer
+    const t = timeAt(e.clientX)
+    const onBox = boxSeek.get(drag.box)
+    seek(onBox ? onBox(t) : t)
+  }
+  drag = null
+})
+
+timeline.addEventListener('pointercancel', (e) => {
+  pointers.delete(e.pointerId)
+  if (pointers.size < 2) pinch = null
+  if (scrub) endScrub()
+  drag = null
+})
+
+timeline.addEventListener('dblclick', (e) => seek(timeAt(e.clientX)))
+
+timeline.addEventListener('pointerleave', () => {
+  hoverX = null
+  scheduleDraw()
+})
+
+timeline.addEventListener(
+  'wheel',
+  (e) => {
+    e.preventDefault()
+    // a trackpad pinch arrives as a wheel with ctrlKey; both zoom about the pointer
+    zoom(e.deltaY > 0 ? 1.4 : 1 / 1.4, timeAt(e.clientX))
+  },
+  { passive: false }
+)
+
+// ---- the overview strip: drag the window, or click to put it somewhere ----
+
+let ovDrag = null
+const ovTimeAt = (clientX) => {
+  const r = overview.getBoundingClientRect()
+  return dayStartOf(state.date) + ((clientX - r.left) / r.width) * DAY
+}
+
+overview.addEventListener('pointerdown', (e) => {
+  overview.setPointerCapture(e.pointerId)
+  setFollow(false) // choosing where to look is the same deliberate act as panning
+  const t = ovTimeAt(e.clientX)
+  const inside = t >= state.view.startMs && t <= state.view.endMs
+  // grabbing the window keeps the point you took hold of under the pointer; elsewhere it centres there
+  ovDrag = { offset: inside ? t - state.view.startMs : state.view.spanMs / 2 }
+  setView({ ...state.view, startMs: t - ovDrag.offset })
+})
+overview.addEventListener('pointermove', (e) => {
+  if (!ovDrag) return
+  setView({ ...state.view, startMs: ovTimeAt(e.clientX) - ovDrag.offset })
+})
+const endOvDrag = () => (ovDrag = null)
+overview.addEventListener('pointerup', endOvDrag)
+overview.addEventListener('pointercancel', endOvDrag)
+
+new ResizeObserver(() => drawTimeline()).observe(timeline)
+
+// ---- controls -------------------------------------------------------------
+
+playBtn.addEventListener('click', () => playToward(1))
+playBackBtn.addEventListener('click', () => playToward(-1))
+$('back').addEventListener('click', () => seek((state.position ?? state.view.startMs) - SEEK_STEP))
+$('fwd').addEventListener('click', () => seek((state.position ?? state.view.startMs) + SEEK_STEP))
+$('toStart').addEventListener('click', () => jumpToEdge(-1))
+$('toEnd').addEventListener('click', () => jumpToEdge(1))
+$('seqPrev').addEventListener('click', () => jumpEvent(-1))
+$('seqNext').addEventListener('click', () => jumpEvent(1))
+$('framePrev').addEventListener('click', () => stepFrame(-1))
+$('frameNext').addEventListener('click', () => stepFrame(1))
+
+// zoom presets: the span stays centred on the playhead, or on the middle of the view without one
+for (const b of zoomBtns) {
+  b.addEventListener('click', () => {
+    const at = state.position ?? state.view.startMs + state.view.spanMs / 2
+    setView({ ...state.view, spanMs: Number(b.dataset.span), startMs: at - Number(b.dataset.span) / 2 })
+  })
+}
+followBtn.addEventListener('click', () => setFollow(!state.follow))
+
+// the day arrows move the date picker, so the existing change handler does the loading (which
+// keeps the day between the first recorded day and today: clampDay)
+const shiftDay = (days) => {
+  const d = new Date(`${state.date}T00:00:00Z`)
+  d.setUTCDate(d.getUTCDate() + days)
+  const next = clampDay(d.toISOString().slice(0, 10))
+  if (next === state.date) return
+  dateInput.value = next
+  dateInput.dispatchEvent(new Event('change'))
+}
+$('dayPrev').addEventListener('click', () => shiftDay(-1))
+$('dayNext').addEventListener('click', () => shiftDay(1))
+
+// ---- the clock you can type into -------------------------------------------
+
+/** Turn the clock into a field holding the time on screen; Enter goes there, Escape puts it back. */
+function openClockInput() {
+  clockInput.value = state.position === null ? '' : fmtClock(state.position, { ms: state.view.spanMs < 120_000, tzOffsetMs: state.tz })
+  clockEl.hidden = true
+  clockInput.hidden = false
+  clockInput.focus()
+  clockInput.select()
+}
+function closeClockInput() {
+  clockInput.hidden = true
+  clockEl.hidden = false
+  scheduleDraw()
+}
+/** "9:34", "09:34:48" or "09:34:48.199" as ms into the day, or null when it reads as nothing. */
+function parseClock(text) {
+  const m = /^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?\s*$/.exec(text ?? '')
+  if (!m) return null
+  const [h, min, s] = [Number(m[1]), Number(m[2]), Number(m[3] ?? 0)]
+  if (h > 23 || min > 59 || s > 59) return null
+  const ms = Number((m[4] ?? '0').padEnd(3, '0'))
+  return ((h * 60 + min) * 60 + s) * 1000 + ms
+}
+clockEl.addEventListener('click', openClockInput)
+clockInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') return closeClockInput()
+  if (e.key !== 'Enter') return
+  const into = parseClock(clockInput.value)
+  if (into === null) {
+    showNotice('That is not a time. Type it as hh:mm:ss.')
+    return
+  }
+  const t = dayStartOf(state.date) + into
+  closeClockInput()
+  ensureVisible(t)
+  seek(t)
+})
+clockInput.addEventListener('blur', closeClockInput)
+
+// ---- the shuttle: spring-loaded, back to ordinary play when let go -----------
+//
+// Letting go returns to 1x forward rather than pausing: scrubbing is how you get to the moment
+// you want, and what you want next is almost always to watch it. Pausing instead meant pressing
+// play again every single time.
+
+function applyShuttle() {
+  const rate = shuttleRate(Number(shuttleEl.value) / 100)
+  if (rate === 0) {
+    // the middle of the travel is a hold, not a pause: nothing moves while the finger rests there
+    shuttleLabelEl.textContent = shuttleLabel(0)
+    if (!state.paused) togglePause()
+    return
+  }
+  if (state.paused) togglePause()
+  // the label shows what is actually playing, not what was asked for, when the source clamped it
+  shuttleLabelEl.textContent = shuttleLabel(setSpeed(rate))
+}
+shuttleEl.addEventListener('input', applyShuttle)
+
+const springBack = () => {
+  shuttleEl.value = '0'
+  const { speed } = clampSpeed(1, state.mode)
+  setSpeed(speed)
+  if (state.paused) togglePause()
+  shuttleLabelEl.textContent = shuttleLabel(speed)
+}
+shuttleEl.addEventListener('pointerup', springBack)
+shuttleEl.addEventListener('pointercancel', springBack)
+shuttleEl.addEventListener('keyup', springBack)
+
+// ---- snapshot ----------------------------------------------------------------
+
+/** The picture on screen as a JPEG named after the camera and the moment it shows. */
+function snapshot() {
+  const src = player.canvas
+  if (!src.width || !src.height) return showNotice('There is no picture to save yet.')
+  const out = document.createElement('canvas')
+  out.width = src.width
+  out.height = src.height
+  out.getContext('2d').drawImage(src, 0, 0)
+  // The overlay goes into the saved still too. A picture taken off this page is often the thing
+  // that ends up in a report, and a still with no time on it is worth a great deal less than one
+  // with the time on it -- the same time the timeline and the clock box are showing.
+  drawOsd(out.getContext('2d'), osdLayoutNow(src.width, src.height, out.getContext('2d')))
+  const when = state.position ?? state.nvrNow
+  // colons are not allowed in a Windows file name, so the time is written with dashes
+  const name = `${cameraSel.selectedOptions[0]?.textContent ?? camKey()} ${fmtDate(when)} ${fmtTime(when).replaceAll(':', '-')}.jpg`
+  out.toBlob((blob) => {
+    if (!blob) return showNotice('The picture could not be saved.')
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = name.replace(/[\\/:*?"<>|]/g, '-')
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(a.href), 10_000)
+  }, 'image/jpeg', 0.92)
+}
+$('snapshot').addEventListener('click', snapshot)
+
+// ---- choosing a clip to export -----------------------------------------------
+//
+// Two marks on the timeline with draggable handles. The times are kept as absolute milliseconds,
+// not as fractions of the view, so zooming and panning never move the clip you chose — which is
+// the whole point of being able to zoom in to pick a moment precisely.
+//
+// Bookmarks sit on the same timeline (see further down): the clip is a stretch you are about to
+// export, a bookmark is a stretch someone wants kept and findable.
+
+const clip = { on: false, from: null, to: null }
+const clipSelEl = $('clipSel')
+const clipFromEl = $('clipFrom')
+const clipToEl = $('clipTo')
+const selectClipBtn = $('selectClip')
+const exportBtn = $('exportClip')
+
+/** Keeps `from` before `to` and both inside the day, whichever handle was moved. */
+function setClip(from, to) {
+  const dayStart = dayStartOf(state.date)
+  const lo = dayStart
+  const hi = dayStart + DAY
+  clip.from = Math.min(Math.max(from, lo), hi)
+  clip.to = Math.min(Math.max(to, lo), hi)
+  if (clip.to < clip.from) [clip.from, clip.to] = [clip.to, clip.from]
+  scheduleDraw()
+}
+
+function clipOn(on) {
+  clip.on = on
+  selectClipBtn.setAttribute('aria-pressed', String(on))
+  selectClipBtn.classList.toggle('pb-on', on)
+  exportBtn.disabled = !on
+  if (on && clip.from === null) {
+    // Start with a stretch you can actually see and grab. A fixed minute looked sensible until you
+    // try it on a two-hour view, where it is under one percent of the width: the two handles land
+    // on top of each other and read as a single mark. So the first clip is a fifth of whatever is
+    // on screen, which keeps the two ends clearly apart at any zoom, within sane bounds.
+    const at = state.position ?? state.view.startMs + state.view.spanMs / 2
+    const half = Math.min(30 * 60_000, Math.max(5000, state.view.spanMs / 10))
+    setClip(at - half, at + half)
+  }
+  scheduleDraw()
+}
+
+/**
+ * Another day is shown: the clip marked on the old one is dropped. Left in place it stayed
+ * exportable, out of sight, and the export dialog named it by the day on screen.
+ */
+function clearClip() {
+  clip.from = null
+  clip.to = null
+  clipOn(false)
+}
+
+const selectClipStart = () => { if (!clip.on) clipOn(true); setClip(state.position ?? clip.from, clip.to ?? (state.position ?? 0) + 60_000) }
+const selectClipEnd = () => { if (!clip.on) clipOn(true); setClip(clip.from ?? (state.position ?? 0) - 60_000, state.position ?? clip.to) }
+
+selectClipBtn.addEventListener('click', () => clipOn(!clip.on))
+
+/** Draws the chosen stretch and its two handles; called from drawTimeline. */
+function drawClip() {
+  const show = clip.on && clip.from !== null && clip.to !== null
+  clipSelEl.hidden = !show
+  clipFromEl.hidden = !show
+  clipToEl.hidden = !show
+  if (!show) return
+  const v = state.view
+  const pct = (t) => ((t - v.startMs) / v.spanMs) * 100
+  clipSelEl.style.left = `${pct(clip.from)}%`
+  clipSelEl.style.width = `${Math.max(0, pct(clip.to) - pct(clip.from))}%`
+  clipFromEl.style.left = `${pct(clip.from)}%`
+  clipToEl.style.left = `${pct(clip.to)}%`
+  const secs = Math.round((clip.to - clip.from) / 1000)
+  clipSelEl.title = `${fmtTime(clip.from)} – ${fmtTime(clip.to)} (${Math.floor(secs / 60)} min ${secs % 60} s)`
+}
+
+/** Dragging a handle. The times come from the timeline's own scale, so zooming keeps them true. */
+function grabHandle(el, which) {
+  el.addEventListener('pointerdown', (e) => {
+    e.stopPropagation() // the timeline's own pointerdown would pan instead
+    el.setPointerCapture(e.pointerId)
+    const move = (ev) => {
+      const t = timeAt(ev.clientX)
+      if (which === 'from') setClip(t, clip.to)
+      else setClip(clip.from, t)
+    }
+    el.addEventListener('pointermove', move)
+    el.addEventListener('pointerup', () => el.removeEventListener('pointermove', move), { once: true })
+    el.addEventListener('pointercancel', () => el.removeEventListener('pointermove', move), { once: true })
+  })
+}
+grabHandle(clipFromEl, 'from')
+grabHandle(clipToEl, 'to')
+
+// ---- bookmarks ---------------------------------------------------------------
+//
+// A bookmark is a stretch someone marked as mattering ("van reverses into the gate"). It is drawn
+// as a diamond on the timeline, listed beside the picture, and — the part that is not about the
+// screen at all — it stops housekeeping deleting that footage later.
+//
+// The rules about what a bookmark may contain live in bookmarks-view.js, which the server loads
+// too, so the form here refuses exactly what the server would refuse. The page still sends the bad
+// one nowhere: the check is only so the person hears about it at once, and the server checks again
+// because a page is not a permission.
+//
+// Times are the same absolute milliseconds as everything else here. In server mode that is the
+// server's clock and in NVR mode the NVR's, which is the clock a bookmark is stored in — a bookmark
+// made while watching an NVR whose clock is out is therefore marked in that NVR's time, the same
+// time printed on the picture, which is what the person marking it saw.
+
+const bmPanel = $('bookmarkPanel')
+const bmBtn = $('bookmark')
+const bmList = $('bookmarkList')
+const bmMarks = $('bookmarkMarks')
+const bmFind = $('bookmarkFind')
+const bmThisCamera = $('bookmarkThisCamera')
+const bmStatus = $('bookmarkStatus')
+const bmDlg = $('bmDlg')
+const bmHeading = $('bmTitleHeading')
+const bmTitle = $('bmTitle')
+const bmFrom = $('bmFrom')
+const bmTo = $('bmTo')
+const bmDay = $('bmDay')
+const bmCameras = $('bmCameras')
+const bmNotes = $('bmNotes')
+const bmMsg = $('bmMsg')
+const bmSave = $('bmSave')
+
+/** Who is signed in, for deciding which Edit and Delete buttons to draw. Filled in at start-up. */
+let viewer = { user: null, admin: false }
+/** Every bookmark the server answered with, whatever camera; the list and the marks filter it. */
+let bookmarks = []
+/** The bookmark being edited, or null while adding a new one. */
+let editing = null
+
+const bmSay = (text, bad = false) => {
+  bmMsg.textContent = text
+  bmMsg.className = `pb-ex-msg${bad ? ' pb-ex-bad' : ''}`
+}
+/** The camera on screen as a key, or null before one is chosen. */
+const thisCamera = () => (state.nvr === null || state.nvr === undefined ? null : camKey())
+
+async function bmApi(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body !== undefined ? { 'content-type': 'application/json' } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined
+  })
+  if (res.status === 401) location.href = '/login.html'
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+  return data
+}
+
+/** The bookmarks the panel and the timeline show: this camera's unless the tick box says otherwise. */
+function shownBookmarks() {
+  return sortBookmarks(filterBookmarks(bookmarks, { text: bmFind.value, camera: bmThisCamera.checked ? thisCamera() : null }))
+}
+
+/**
+ * Reads every bookmark once and keeps them here. They are few and they change rarely, so filtering
+ * in the browser keeps typing in the Find box instant and saves a request per keystroke.
+ */
+async function loadBookmarks() {
+  try {
+    const { bookmarks: list, user, admin } = await bmApi('GET', '/api/bookmarks')
+    bookmarks = list ?? []
+    viewer = { user: user ?? viewer.user, admin: admin === true }
+    bmStatus.textContent = ''
+  } catch (e) {
+    // The picture still plays without them, so this is a note rather than a takeover of the page.
+    bmStatus.textContent = `Bookmarks are not available: ${e.message}`
+  }
+  drawBookmarkList()
+  scheduleDraw()
+}
+
+/** The diamonds and their faint bands. Called from drawTimeline, so zooming and panning move them. */
+function drawBookmarks() {
+  const marks = bookmarkMarkers(state.view, shownBookmarks())
+  bmMarks.replaceChildren(
+    ...marks.flatMap((m) => {
+      const nodes = []
+      if (m.widthPct > 0) {
+        const band = document.createElement('div')
+        band.className = 'pb-bm-band'
+        band.style.left = `${m.leftPct}%`
+        band.style.width = `${m.widthPct}%`
+        nodes.push(band)
+      }
+      const d = document.createElement('button')
+      d.type = 'button'
+      d.className = 'pb-bm-mark'
+      d.style.left = `${m.leftPct}%`
+      d.title = `${m.title} · ${fmtTime(m.ms)}${m.user ? ` · ${m.user}` : ''}`
+      d.setAttribute('aria-label', d.title)
+      // the true start, not the diamond's position: a mark clamped to the edge of the window stands
+      // for a bookmark that begins off-screen
+      d.addEventListener('click', (e) => {
+        e.stopPropagation() // the timeline's own pointer handling would pan or seek instead
+        ensureVisible(m.ms)
+        seek(m.ms)
+      })
+      nodes.push(d)
+      return nodes
+    })
+  )
+}
+
+/** The list beside the picture. Edit and Delete appear only for the bookmarks this person may change. */
+function drawBookmarkList() {
+  const list = shownBookmarks()
+  if (!list.length) {
+    bmList.replaceChildren()
+    if (!bmStatus.textContent) bmStatus.textContent = bookmarks.length ? 'Nothing matches.' : 'No bookmarks yet.'
+    return
+  }
+  if (bmStatus.textContent === 'Nothing matches.' || bmStatus.textContent === 'No bookmarks yet.') bmStatus.textContent = ''
+  bmList.replaceChildren(
+    ...list.map((b) => {
+      const li = document.createElement('li')
+      const go = document.createElement('button')
+      go.type = 'button'
+      go.className = 'pb-bm-go'
+      go.append(b.title)
+      const when = document.createElement('span')
+      when.className = 'pb-bm-when'
+      // The day is shown as well as the clock: the list is not limited to the day on screen, and a
+      // bookmark from last week reading only "09:14" would look like this morning.
+      when.textContent = `${fmtDate(b.startMs)} ${fmtTime(b.startMs)} · ${spanText(b.startMs, b.endMs)} · ${b.user ?? 'not available'}`
+      go.append(when)
+      go.addEventListener('click', () => openBookmark(b))
+      li.append(go)
+      if (b.description) {
+        const p = document.createElement('p')
+        p.className = 'pb-bm-note'
+        p.textContent = b.description
+        li.append(p)
+      }
+      if (canEdit(b, viewer)) {
+        const actions = document.createElement('div')
+        actions.className = 'pb-bm-actions'
+        const edit = document.createElement('button')
+        edit.type = 'button'
+        edit.textContent = 'Edit'
+        edit.addEventListener('click', () => openBookmarkDialog(b))
+        const del = document.createElement('button')
+        del.type = 'button'
+        del.textContent = 'Delete'
+        del.addEventListener('click', () => removeBookmark(b))
+        actions.append(edit, del)
+        li.append(actions)
+      }
+      return li
+    })
+  )
+}
+
+/**
+ * Clicking a bookmark: show the camera and moment it marks, switching camera and day if need be.
+ * The day and the camera are set before a single reload rather than each firing its own change
+ * handler, because two reloads in flight at once land wherever the slower one finishes.
+ */
+async function openBookmark(b) {
+  const key = b.cameras?.[0]
+  const known = Boolean(key) && playbackCams.some((c) => `${c.nvr}/${c.ch}` === key)
+  const day = fmtDate(b.startMs)
+  if (day !== state.date) {
+    clearClip()
+    state.date = day
+    dateInput.value = day
+    viewWholeDay()
+  }
+  state.position = b.startMs
+  if (known && key !== thisCamera()) {
+    const [nvr, ch] = key.split('/')
+    await goToCamera(nvr, Number(ch), b.startMs)
+  } else {
+    await reloadKeepingPosition()
+  }
+  ensureVisible(b.startMs)
+  seek(b.startMs)
+}
+
+/**
+ * The add/edit dialog. Adding starts from the clip if one is marked — the usual way of working is
+ * to mark the stretch first and then say what it is — and otherwise from the moment on screen, as a
+ * bookmark of that instant.
+ */
+async function openBookmarkDialog(existing = null) {
+  editing = existing
+  bmHeading.textContent = existing ? 'Edit bookmark' : 'Add a bookmark'
+  const from = existing ? existing.startMs : clip.on && clip.from !== null ? clip.from : state.position
+  const to = existing ? existing.endMs : clip.on && clip.to !== null ? clip.to : state.position
+  if (from === null || to === null) return showNotice('Nothing is playing yet, so there is no moment to bookmark.')
+  bmTitle.value = existing?.title ?? ''
+  bmNotes.value = existing?.description ?? ''
+  bmFrom.value = fmtTime(from)
+  bmTo.value = fmtTime(to)
+  bmDay.textContent = `On ${fmtDate(from)}, in the time shown on the picture.`
+  bmSay('')
+
+  const wanted = new Set(existing?.cameras ?? [thisCamera()].filter(Boolean))
+  const cams = await fetch('/api/cameras').then((r) => (r.ok ? r.json() : [])).catch(() => [])
+  bmCameras.replaceChildren(
+    ...cams.map((c) => {
+      const o = document.createElement('option')
+      o.value = `${c.nvr}/${c.ch}`
+      o.textContent = `${c.name} · ${c.nvrName}`
+      o.selected = wanted.has(o.value)
+      return o
+    })
+  )
+  bmDlg.showModal()
+  bmTitle.focus()
+}
+
+/** B, and the Add button. */
+function addBookmark() {
+  if (bmPanel.hidden) showBookmarkPanel(true)
+  openBookmarkDialog(null)
+}
+
+/**
+ * The typed times back into absolute ms. They are read against the day the bookmark is on rather
+ * than the day on screen, so editing an old bookmark from today's view does not move it to today.
+ */
+function timesFromDialog(dayMs) {
+  const dayStart = dayStartOf(fmtDate(dayMs))
+  const from = parseClock(bmFrom.value)
+  const to = parseClock(bmTo.value)
+  if (from === null || to === null) return null
+  // A bookmark that runs over midnight is typed with the end earlier than the start; treating that
+  // as the next day is the only reading that is not simply a mistake.
+  return { startMs: dayStart + from, endMs: dayStart + to + (to < from ? DAY : 0) }
+}
+
+bmSave.addEventListener('click', async () => {
+  const cameras = [...bmCameras.selectedOptions].map((o) => o.value)
+  const base = editing ? editing.startMs : (clip.on && clip.from !== null ? clip.from : state.position) ?? Date.now()
+  const times = timesFromDialog(base)
+  if (!times) return bmSay('Type the times as hh:mm:ss.', true)
+  const wanted = { cameras, ...times, title: bmTitle.value, description: bmNotes.value }
+  const checked = checkBookmark(wanted)
+  if (!checked.ok) return bmSay(checked.error, true)
+
+  bmSave.disabled = true
+  try {
+    if (editing) await bmApi('PATCH', `/api/bookmarks/${editing.id}`, checked.value)
+    else await bmApi('POST', '/api/bookmarks', checked.value)
+    bmDlg.close()
+    await loadBookmarks()
+    showNotice(editing ? 'Bookmark saved.' : 'Bookmark added.')
+  } catch (e) {
+    bmSay(e.message, true)
+  } finally {
+    bmSave.disabled = false
+  }
+})
+
+async function removeBookmark(b) {
+  if (!confirm(`Delete the bookmark "${b.title}"?`)) return
+  try {
+    await bmApi('DELETE', `/api/bookmarks/${b.id}`)
+    await loadBookmarks()
+  } catch (e) {
+    bmStatus.textContent = e.message
+  }
+}
+
+function showBookmarkPanel(on) {
+  bmPanel.hidden = !on
+  bmBtn.setAttribute('aria-pressed', String(on))
+  bmBtn.classList.toggle('pb-on', on)
+  // Bookmarks lives in More: More is lit while its panel is open, so the bar shows where it came from
+  moreBtn.classList.toggle('pb-on', on)
+  if (on) loadBookmarks()
+}
+
+bmBtn.addEventListener('click', () => showBookmarkPanel(bmPanel.hidden))
+$('bookmarkAdd').addEventListener('click', () => openBookmarkDialog(null))
+bmFind.addEventListener('input', () => {
+  drawBookmarkList()
+  scheduleDraw()
+})
+bmThisCamera.addEventListener('change', () => {
+  drawBookmarkList()
+  scheduleDraw()
+})
+
+$('shortcutsBtn').addEventListener('click', () => shortcutsDlg.showModal())
+$('shortcutsClose').addEventListener('click', () => shortcutsDlg.close())
+
+qualitySel.addEventListener('change', () => {
+  const v = qualitySel.value
+  if (v === 'server' || v === 'original' || v === 'sd-nvr') {
+    // server recordings (HD; for a remote viewer the light copy or the original) or the NVR's SD: the
+    // other mode or socket, at the same moment (serverSeek opens a new socket when the original was
+    // or was not asked for). The viewer's own choice for this camera, so an earlier NAS-outage
+    // fallback (fallBackToNvr) no longer overrides it
+    nvrFallback.clear(camKey())
+    state.quality = v
+    if (v === 'sd-nvr') state.stream = 1
+    return reloadKeepingPosition().then(() => {
+      // HD or Original (server) chosen, but this day plays from the NVR after all (no server footage, H.265)
+      if (v !== 'sd-nvr' && state.mode !== 'server' && lastPick) showNotice(lastPick.why)
+    })
+  }
+  state.stream = Number(v)
+  if (state.position !== null) seek(state.position)
+})
+
+/** Loads the day again (its mode may change) and plays on at the same moment, converted by the skew. */
+async function reloadKeepingPosition() {
+  const from = { mode: state.mode, skew: state.skew }
+  const pos = state.position
+  await loadDay(() => {
+    const p = convertTime(pos, from.mode, state.mode, { fromSkew: from.skew, toSkew: state.skew })
+    if (p !== null) seek(p)
+  })
+}
+
+cameraSel.addEventListener('change', async () => {
+  leaveCamera() // (first: the new camera may have nothing to play at this moment)
+  const [nvr, ch] = cameraSel.value.split('/')
+  state.nvr = nvr
+  state.ch = Number(ch)
+  saveLastCamera(pageStorage, cameraSel.value) // Playback opens on it next time, in this browser
+  history.replaceState(null, '', `?${nvrQ()}&ch=${state.ch}`)
+  clearSearch(true)
+  await reloadKeepingPosition()
+})
+
+/**
+ * The NVR's clock and recording days. Returns the error if the NVR is busy (then nothing
+ * changes); otherwise null, with this computer's clock standing in if the NVR's can't be read.
+ */
+async function loadNvrInfo() {
+  const nvr = state.nvr
+  const [now, dates] = await Promise.all([
+    api(`/api/playback/now?${nvrQ()}`).catch((e) => e),
+    api(`/api/playback/dates?${nvrQ()}`).catch((e) => e)
+  ])
+  const busy = [now, dates].find((r) => r?.retryAfterS)
+  if (busy) return busy
+  const clock = now instanceof Error ? { now: Date.now() } : now
+  if (!(now instanceof Error)) state.clockOf = nvr
+  state.nvrNow = clock.now
+  state.tz = clock.tzOffsetMs ?? 0
+  state.skew = clock.skewMs ?? state.skew
+  dateInput.max = fmtDate(state.nvrNow)
+  updateDayArrows()
+  dateInput.min = (Array.isArray(dates) && dates[0]) || ''
+  return null
+}
+
+dateInput.addEventListener('change', async () => {
+  if (!dateInput.value) return
+  // no day after today (the NVR's today) and none before the first recorded day: the picker's
+  // max/min are not enforced everywhere (typing a date, an iPhone's date wheel), and the › button
+  // used to walk on into the future (2026-10-12 on the 26th of September)
+  const day = clampDay(dateInput.value)
+  if (day !== dateInput.value) {
+    if (dateInput.value > day) showMessage('That day has not happened yet: showing today.')
+    dateInput.value = day
+  }
+  if (dateInput.value !== state.date) clearClip()
+  state.date = dateInput.value
+  updateDayArrows()
+  viewWholeDay()
+  if (ws?.kind === 'server' && ws.readyState === WebSocket.OPEN) {
+    // server mode keeps its socket: paused, and what it still sends is dropped
+    ws.gen++
+    ws.send(JSON.stringify({ pause: true }))
+    throttle.cancel()
+    player.seekReset()
+  } else {
+    if (ws) {
+      ws.onclose = null
+      ws.close()
+      ws = null
+    }
+    player.reset()
+  }
+  state.position = null
+  clearSearch(false)
+  await loadDay(() => {
+    if (state.ranges.length) seek(state.ranges[0][0])
+  })
+})
+
+document.addEventListener('keydown', (e) => {
+  // a textarea counts too: B in the bookmark notes used to open a second bookmark dialog
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return
+  // a held arrow: one seek per press, not one NVR playback per auto-repeat (pb-transport.js)
+  if (ignoredRepeat(e)) return
+  if (e.target === timeline && ['ArrowLeft', 'ArrowRight', '+', '=', '-', '_', '0'].includes(e.key)) e.preventDefault()
+  if (e.key === ' ') {
+    e.preventDefault()
+    togglePause()
+  } else if (e.key === 'ArrowLeft') {
+    e.shiftKey ? jumpEvent(-1) : seek((state.position ?? 0) - 10_000)
+  } else if (e.key === 'ArrowRight') {
+    e.shiftKey ? jumpEvent(1) : seek((state.position ?? 0) + 10_000)
+  } else if (e.key === 'd' || e.key === 'D') {
+    showStats = !showStats
+    document.querySelector('.pb-main').classList.toggle('show-stats', showStats)
+  } else if (e.key === ',') {
+    stepFrame(-1)
+  } else if (e.key === '.') {
+    stepFrame(1)
+  } else if (e.key === 'Home' || e.key === 'End') {
+    // the first or the newest recording of the day (the page has nothing to scroll in their place)
+    e.preventDefault()
+    if (!e.repeat) jumpToEdge(e.key === 'Home' ? -1 : 1)
+  } else if (e.key === 'r' || e.key === 'R') {
+    // play backwards, where the footage can be (the button is hidden where it cannot)
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && reverseOffered()) playToward(-1)
+  } else if (e.key === '<' || e.key === '>') {
+    stepSpeed(e.key === '<' ? -1 : 1)
+  } else if (e.key === '+' || e.key === '=') {
+    zoom(1 / 2)
+  } else if (e.key === '-' || e.key === '_') {
+    zoom(2)
+  } else if (e.key === '0') {
+    viewWholeDay()
+  } else if (e.key === 't' || e.key === 'T') {
+    e.preventDefault()
+    openClockInput()
+  } else if (e.key === '[') {
+    selectClipStart()
+  } else if (e.key === ']') {
+    selectClipEnd()
+  } else if (e.key === 'b' || e.key === 'B') {
+    addBookmark()
+  } else if (e.key === 'f' || e.key === 'F') {
+    toggleFullscreen()
+  } else if (e.key === '?') {
+    shortcutsDlg.showModal()
+  }
+})
+
+setInterval(() => {
+  if (!showStats) return
+  const s = player.stats
+  const src = state.mode === 'server' ? (state.src ?? 'server') : 'nvr'
+  videoEl.querySelector('.stats').textContent = [
+    `${s.width}×${s.height} ${s.codec} (${s.hw})`,
+    `decoded ${s.coded} · visible ${s.visible} · canvas ${player.canvas.width}×${player.canvas.height}`,
+    `${s.fps} fps · jitter ${s.jitterMs} ms`,
+    `buffer ${s.delayMs} ms · ${s.kbps} kbps`,
+    `queue ${s.queuedFrames ?? 0} frames · image estimate ${s.queuedImageMiB ?? 0} MiB · decoding ${s.decodeQueue ?? 0}`,
+    `dropped ${s.dropped} · late ${s.late}`,
+    `src ${src} · start ${startMs ?? '-'} ms`
+  ].join('\n')
+}, 1000)
+
+// keep today's timeline growing
+setInterval(async () => {
+  if (state.mode === 'server') return refreshServer().catch(() => {})
+  // without Playback SD the NVR is not asked (its clock and recordings: a day with nothing to play)
+  if (!rightsNow().sd) return
+  // another camera or day chosen while an answer was on its way (a busy NVR takes seconds): that
+  // answer is the old one's, and used to replace the new one's ranges
+  const token = dayToken
+  try {
+    const clock = await api(`/api/playback/now?${nvrQ()}`)
+    if (token !== dayToken) return
+    state.nvrNow = clock.now
+    state.tz = clock.tzOffsetMs ?? state.tz
+    if (state.date === fmtDate(state.nvrNow)) {
+      const { ranges, events } = await api(`/api/playback/recordings?${nvrQ()}&ch=${state.ch}&date=${state.date}`)
+      if (token !== dayToken) return
+      state.ranges = ranges
+      state.events = events
+      scheduleDraw()
+    }
+  } catch {}
+}, 60_000)
+
+// ---- motion search in a box ---------------------------------------------------
+
+const searchToggle = $('searchToggle')
+const searchPanel = $('searchPanel')
+const boxLayer = $('boxLayer')
+const boxEl = $('box')
+const searchGo = $('searchGo')
+const searchStop = $('searchStop')
+const searchStatus = $('searchStatus')
+const searchProgress = $('searchProgress')
+const searchHits = $('searchHits')
+let box = null // [x, y, w, h] as fractions of the picture
+let searchWs = null
+
+/** Where the picture actually is inside the tile (the canvas letterboxes it). */
+function pictureRect() {
+  const r = videoEl.querySelector('canvas').getBoundingClientRect()
+  const vw = player.videoWidth || 16
+  const vh = player.videoHeight || 9
+  const scale = Math.min(r.width / vw, r.height / vh)
+  const w = vw * scale
+  const h = vh * scale
+  return { left: r.left + (r.width - w) / 2, top: r.top + (r.height - h) / 2, width: w, height: h }
+}
+
+function showBox() {
+  if (!box) {
+    boxEl.hidden = true
+    return
+  }
+  const pic = pictureRect()
+  const tile = videoEl.getBoundingClientRect()
+  Object.assign(boxEl.style, {
+    left: `${pic.left - tile.left + box[0] * pic.width}px`,
+    top: `${pic.top - tile.top + box[1] * pic.height}px`,
+    width: `${box[2] * pic.width}px`,
+    height: `${box[3] * pic.height}px`
+  })
+  boxEl.hidden = false
+}
+new ResizeObserver(showBox).observe(videoEl)
+
+let drawFrom = null
+const clamp01 = (v) => Math.min(1, Math.max(0, v))
+const toPicture = (e) => {
+  const pic = pictureRect()
+  return [clamp01((e.clientX - pic.left) / pic.width), clamp01((e.clientY - pic.top) / pic.height)]
+}
+boxLayer.addEventListener('pointerdown', (e) => {
+  drawFrom = toPicture(e)
+  try {
+    boxLayer.setPointerCapture(e.pointerId) // keep the drag going outside the layer
+  } catch {}
+})
+boxLayer.addEventListener('pointermove', (e) => {
+  if (!drawFrom) return
+  const [x, y] = toPicture(e)
+  box = [Math.min(x, drawFrom[0]), Math.min(y, drawFrom[1]), Math.abs(x - drawFrom[0]), Math.abs(y - drawFrom[1])]
+  showBox()
+})
+boxLayer.addEventListener('pointerup', () => {
+  drawFrom = null
+  if (box && (box[2] < 0.02 || box[3] < 0.02)) box = null // a click, not a drag
+  showBox()
+  searchGo.disabled = !box || Boolean(searchWs)
+  $('searchHelp').textContent = box ? 'Drag again to redraw the box.' : 'Drag a box on the picture around the area to watch.'
+})
+
+searchToggle.addEventListener('click', () => {
+  const open = searchPanel.hidden
+  searchPanel.hidden = !open
+  boxLayer.hidden = !open
+  searchToggle.setAttribute('aria-pressed', String(open))
+  if (open) {
+    // freeze the picture while drawing so the box lines up with what you see
+    if (!state.paused) togglePause()
+  } else {
+    stopSearch()
+  }
+  showBox()
+})
+
+function searchWindow() {
+  const pos = state.position ?? state.view.startMs + state.view.spanMs / 2
+  const mode = $('searchRange').value
+  let from
+  let to
+  if (mode === 'hour') [from, to] = [pos - 3_600_000, pos]
+  else if (mode === 'day') [from, to] = [dayStartOf(state.date), dayStartOf(state.date) + DAY]
+  else [from, to] = [state.view.startMs, state.view.endMs]
+  const dayStart = dayStartOf(state.date)
+  from = Math.max(from, dayStart)
+  to = Math.min(to, dayStart + DAY, state.nvrNow - 60_000)
+  return [Math.round(from), Math.round(to)]
+}
+
+function renderHits() {
+  const items = [...state.hits]
+    .sort((a, b) => a.start - b.start)
+    .map((hit) => {
+      const li = document.createElement('li')
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      const when = document.createElement('b')
+      when.textContent = fmtTime(hit.start)
+      const secs = Math.round((hit.end - hit.start) / 1000)
+      const len = document.createElement('span')
+      len.textContent = secs > 2 ? `${secs}s` : 'moment'
+      btn.append(when, len)
+      btn.addEventListener('click', () => {
+        ensureVisible(hit.start)
+        seek(hit.start - 3000)
+      })
+      li.append(btn)
+      return li
+    })
+  searchHits.replaceChildren(...items)
+}
+
+function startSearch() {
+  if (!box || searchWs) return
+  const [from, to] = searchWindow()
+  if (to <= from) {
+    searchStatus.textContent = 'Nothing recorded in that range yet.'
+    return
+  }
+  state.hits = []
+  renderHits()
+  scheduleDraw()
+  // free this page's own playback while searching: the NVR only handles about two
+  // playbacks at once well, and the search wants both (Play or a result resumes it).
+  // Server playback does not use the NVR: its socket stays, paused.
+  if (ws && ws.kind !== 'server') {
+    ws.onclose = null
+    ws.close()
+    ws = null
+  }
+  if (!state.paused) {
+    state.paused = true
+    send({ pause: true })
+    player.pause()
+    updatePlayButton()
+  }
+  // the search runs on the NVR's recordings, in its clock: server-mode times are converted
+  const off = state.mode === 'server' ? state.skew : 0
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const params = new URLSearchParams({
+    ch: state.ch,
+    from: from + off,
+    to: to + off,
+    box: box.map((v) => v.toFixed(4)).join(','),
+    sens: $('searchSens').value
+  })
+  const sock = new WebSocket(`${proto}://${location.host}/motion?${nvrQ()}&${params}`)
+  searchWs = sock
+  let total = 1
+  const started = Date.now()
+  searchGo.disabled = true
+  searchStop.hidden = false
+  searchProgress.hidden = false
+  searchProgress.firstElementChild.style.width = '0%'
+  searchStatus.textContent = `Searching ${fmtTime(from)} – ${fmtTime(to)}…`
+  sock.onmessage = (e) => {
+    const msg = JSON.parse(e.data)
+    if (msg.type === 'plan') {
+      total = Math.max(1, msg.total)
+      const mins = Math.max(1, Math.round(msg.total / 60_000))
+      searchStatus.textContent = msg.basedOnEvents
+        ? `Checking ${mins} min of footage where the NVR saw motion…`
+        : `Checking ${mins} min of footage…`
+    } else if (msg.type === 'progress') {
+      searchProgress.firstElementChild.style.width = `${Math.min(100, (msg.done / total) * 100)}%`
+    } else if (msg.type === 'hit') {
+      state.hits.push(off ? { ...msg, start: msg.start - off, end: msg.end - off } : msg)
+      renderHits()
+      scheduleDraw()
+    } else if (msg.type === 'done') {
+      const secs = Math.round((Date.now() - started) / 1000)
+      const plural = msg.hits === 1 ? '' : 's'
+      searchStatus.textContent = msg.hits
+        ? `Found ${msg.hits} moment${plural} with movement in the box (${secs}s). Click one to watch it.`
+        : `No movement in the box (${secs}s). Try a higher sensitivity or a bigger box.`
+    } else if (msg.type === 'error') {
+      searchStatus.textContent = msg.message
+    }
+  }
+  sock.onclose = () => {
+    if (searchWs !== sock) return
+    searchWs = null
+    searchGo.disabled = !box
+    searchStop.hidden = true
+    searchProgress.hidden = true
+  }
+}
+
+function stopSearch() {
+  if (!searchWs) return
+  const ws = searchWs
+  searchWs = null
+  ws.close()
+  searchGo.disabled = !box
+  searchStop.hidden = true
+  searchProgress.hidden = true
+  searchStatus.textContent = 'Search stopped.'
+}
+
+/** Clears results; with dropBox also forgets the box (another camera). */
+function clearSearch(dropBox) {
+  stopSearch()
+  state.hits = []
+  renderHits()
+  searchStatus.textContent = ''
+  if (dropBox) {
+    box = null
+    showBox()
+    searchGo.disabled = true
+  }
+  scheduleDraw()
+}
+
+searchGo.addEventListener('click', startSearch)
+searchStop.addEventListener('click', stopSearch)
+$('searchClear').addEventListener('click', () => clearSearch(true))
+
+// ---- start ----------------------------------------------------------------
+
+document.getElementById('logout').addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST' })
+  location.href = '/login.html'
+})
+
+if (!('VideoDecoder' in window)) {
+  showMessage(
+    window.isSecureContext
+      ? 'This browser cannot decode video (no WebCodecs). Use a current Chrome, Edge or Safari.'
+      : 'Video needs a secure connection. Open this page with https:// (port 8443) instead.'
+  )
+}
+
+updateModeUi()
+const [me, cameras] = await Promise.all([api('/api/me'), api('/api/cameras?for=playback')])
+playbackCams = cameras
+$('whoami').textContent = me.user
+if (me.admin) { const st = $('sitesTab'); if (st) st.hidden = false; const se = $('settingsTab'); if (se) se.hidden = false }
+// who this is, for deciding which bookmarks offer Edit and Delete (the server decides again itself)
+viewer = { user: me.user, admin: me.admin === true }
+state.h265 = await canDecodeH265()
+
+// The cameras: online ones only, so nothing is offered that cannot be used; the camera being watched
+// stays even if it goes offline (marked so), rather than vanishing from under the viewer. Re-read
+// every 30 s, so a camera that comes back appears by itself. The hidden #camera select holds every
+// one of them and the choice, where the rest of the page reads it; the find box (pb-picker.js) is
+// what the viewer sees and types into, and it searches this same list, not the server.
+let cameraListSig = ''
+// the site chosen in Browse ('' for every site): what the list shows before anything is typed
+let pickedSite = ''
+// this browser's storage, for the last camera watched; reaching it can throw (blocked site data)
+const pageStorage = (() => { try { return window.localStorage } catch { return null } })()
+const currentCam = () => playbackCams.find((c) => cameraKey(c) === cameraSel.value) ?? null
+function fillCameraList(list, keep) {
+  const usable = cameraChoices(list, { keep }).flatMap((g) => g.cameras)
+  const sig = JSON.stringify(usable.map((c) => [c.nvr, c.ch, c.name, c.online, c.site, c.nvrName]))
+  const was = cameraSel.value
+  const changed = sig !== cameraListSig
+  if (changed) {
+    cameraListSig = sig
+    cameraSel.replaceChildren(...usable.map((cam) => new Option(cameraLabel(cam), cameraKey(cam))))
+  }
+  if (keep) cameraSel.value = keep
+  // (only when something changed: the 30 s re-read must not move the highlight in an open list)
+  if (changed || cameraSel.value !== was) cameraFinder?.refresh()
+}
+/** Switches to a camera picked in the find box or in Browse, through the select's usual change. */
+function pickCamera(cam) {
+  if (cam.site && pickedSite && cam.site !== pickedSite) {
+    // a camera at another site: Browse follows it, as when it is picked in Browse
+    pickedSite = cam.site
+    playbackBrowser.refresh()
+  }
+  const key = cameraKey(cam)
+  if (key === cameraSel.value) return
+  fillCameraList(playbackCams, key)
+  cameraSel.value = key
+  cameraSel.dispatchEvent(new Event('change'))
+}
+// ?nvr=ID&ch=N from Live, an alarm or a shared link; otherwise the camera this browser watched last
+const params = new URLSearchParams(location.search)
+const context = workspaceSite()
+const first = startCamera(cameras, { nvr: params.get('nvr'), ch: params.get('ch'), last: readLastCamera(pageStorage), site: context })
+const sites = new Set(cameras.map((c) => c.site).filter(Boolean))
+// Browse shows the site worked in; when the camera opened is elsewhere (a link, the last one
+// watched), that camera's site, so the list and the picture agree
+pickedSite = first && first.site !== context && sites.has(first.site) ? first.site : sites.has(context) ? context : ''
+let cameraFinder = null
+if (first) fillCameraList(cameras, cameraKey(first))
+cameraFinder = mountCameraFinder({
+  input: $('playbackCameraSearch'),
+  list: $('cameraList'),
+  choices: (query) => cameraChoices(playbackCams, { site: pickedSite, query, keep: cameraSel.value }),
+  current: currentCam,
+  onPick: pickCamera
+})
+const playbackBrowser = mountCameraBrowser({
+  host: document.querySelector('.pb-scope'), cameras: () => playbackCams, selectedSite: () => pickedSite,
+  onSite: (name) => { pickedSite = name; cameraFinder.refresh() },
+  onCamera: (cam) => { pickedSite = cam.site; pickCamera(cam) }
+})
+setInterval(async () => {
+  const list = await fetch('/api/cameras?for=playback').then((r) => (r.ok ? r.json() : null)).catch(() => null)
+  if (!Array.isArray(list)) return
+  const was = JSON.stringify(rightsNow())
+  playbackCams = list
+  fillCameraList(list, cameraSel.value || null)
+  // this camera's rights changed (given or taken away): the menus follow at once
+  if (JSON.stringify(rightsNow()) !== was) updateModeUi()
+}, 30_000)
+if (!first) {
+  showMessage(me.admin ? 'No cameras yet. Add an NVR with: docker exec -it tvt-cctv node cctv/nvr.mjs add' : 'No cameras have been shared with you for playback yet. Ask an admin for access.')
+  throw new Error('no cameras')
+}
+state.nvr = first.nvr
+state.ch = first.ch
+cameraSel.value = cameraKey(first)
+saveLastCamera(pageStorage, cameraKey(first))
+
+/**
+ * Today, playing from shortly before now. From the server's recordings when it has this camera's
+ * (the NVR is not waited for: a minute back, the file being written is readable); otherwise from
+ * the NVR as before (a few minutes back; while the NVR is busy: again when it is free).
+ */
+async function start() {
+  if (state.clockOf === null) {
+    // (until the timeline or the NVR says: this computer's clock and time zone)
+    state.tz = -new Date().getTimezoneOffset() * 60_000
+    state.nvrNow = Date.now()
+  }
+  state.date = fmtDate(state.nvrNow)
+  const tl = await fetchTimeline()
+  if (pickMode({ timeline: tl, h265: state.h265, quality: qualityForCam(camKey(), state.quality, nvrFallback.used), rights: rightsNow() }).mode === 'server') {
+    if (Number.isFinite(tl.tzOffsetMs)) state.tz = tl.tzOffsetMs
+    state.nvrNow = tl.now
+    state.date = fmtDate(state.nvrNow)
+    dateInput.value = state.date
+    viewWholeDay()
+    return loadDay(() => {
+      if (state.mode !== 'server') return startNvrDay()
+      // a minute back (the file being written is readable), the last hour in view
+      setView({ startMs: state.nvrNow - 60 * 60_000, spanMs: 2 * 60 * 60_000 })
+      const last = state.ranges.at(-1)
+      if (last) seek(Math.min(state.nvrNow - START_BACK_SERVER_MS, last[1] - START_BACK_SERVER_MS))
+    })
+  }
+  // without Playback SD there is no NVR side: the day says what the server has (pickMode 'none')
+  if (!rightsNow().sd) {
+    // (today shown in the date box and on the timeline, as the other two ways in do)
+    dateInput.value = state.date
+    viewWholeDay()
+    return loadDay(() => {})
+  }
+  const busy = await loadNvrInfo()
+  // (while busy: today by this computer's clock, so the page works meanwhile)
+  state.date = fmtDate(state.nvrNow)
+  dateInput.value = state.date
+  viewWholeDay()
+  if (busy) {
+    drawTimeline()
+    retryWhenFree(busy, start)
+    return
+  }
+  await loadDay(startNvrDay)
+}
+
+/** NVR playback of today: 5 minutes back (the newest minute or so is still being written by the NVR), last hour in view. */
+function startNvrDay() {
+  setView({ startMs: state.nvrNow - 60 * 60_000, spanMs: 2 * 60 * 60_000 })
+  if (state.ranges.length) seek(Math.min(state.nvrNow - START_BACK_MS, state.ranges.at(-1)[1] - START_BACK_MS))
+}
+// a failure here (a busy NVR, a bad answer) must not leave the rest of the page unwired
+await start().catch((e) => console.error('[playback] start', e))
+// ?t=ms: open at that moment (from Many cameras, an alarm, a shared link)
+{
+  // (a link never opens in the future: at the latest, now)
+  const t0 = Math.min(Number(params.get('t')), state.nvrNow)
+  if (Number.isFinite(t0) && t0 > 0) {
+    const day = fmtDate(t0)
+    if (day !== state.date) {
+      state.date = day
+      dateInput.value = day
+      viewWholeDay()
+    }
+    state.position = t0
+    await reloadKeepingPosition()
+    ensureVisible(t0)
+    seek(t0)
+  }
+}
+updatePlayButton()
+
+// One camera | Many cameras: the camera and the moment go with you
+$('modeMany')?.addEventListener('click', () => {
+  const at = Number.isFinite(state.position) ? `&at=${Math.round(state.position)}` : ''
+  location.href = `/wall.html?cameras=${encodeURIComponent(keyOf(state.nvr, state.ch))}${at}`
+})
+
+// ---- digital zoom on the picture ---------------------------------------------
+//
+// Magnifies what is already on screen, for reading a face, a number plate or a till display.
+// It is only a transform of the canvas: no extra video is fetched and no detail is invented, so
+// zooming in past what the camera recorded simply shows bigger pixels.
+//
+// The motion-search box sits over the same picture and needs raw pointer coordinates, so zooming
+// is disabled while that box is open rather than trying to map coordinates through the transform.
+
+const MAX_ZOOM = 8
+const zoomCanvas = videoEl.querySelector('canvas')
+const zoomState = { z: 1, x: 0, y: 0 } // x and y are pixel offsets of the scaled picture
+
+const zoomBusy = () => !boxLayer.hidden
+
+/**
+ * Keeps the picture covering the tile: you can never pan to an empty edge. Measured on the tile, which
+ * the canvas fills: the canvas's own box is the zoomed and moved one (its transform is in it), and
+ * limits taken from that let the picture be panned off the screen.
+ */
+function clampZoom() {
+  const { width: w, height: h } = videoEl.getBoundingClientRect()
+  const maxX = (zoomState.z - 1) * w
+  const maxY = (zoomState.z - 1) * h
+  zoomState.x = Math.min(0, Math.max(-maxX, zoomState.x))
+  zoomState.y = Math.min(0, Math.max(-maxY, zoomState.y))
+}
+
+function applyZoom() {
+  clampZoom()
+  const { z, x, y } = zoomState
+  zoomCanvas.style.transformOrigin = '0 0'
+  zoomCanvas.style.transform = z === 1 ? '' : `translate(${x}px, ${y}px) scale(${z})`
+  videoEl.classList.toggle('zoomed', z > 1)
+  const badge = $('zoomBadge')
+  if (badge) {
+    badge.hidden = z === 1
+    badge.textContent = `${z.toFixed(1)}×`
+  }
+}
+
+// wheel, two-finger pinch, drag to pan, double-click / double-tap back (pinch-zoom.js: the same as
+// Live's full-size view; phones could not zoom here at all before)
+const zoomer = attachZoom(videoEl, {
+  apply: (z, x, y) => {
+    zoomState.z = z
+    zoomState.x = x
+    zoomState.y = y
+    applyZoom()
+  },
+  // the tile, not the canvas: the canvas's box moves and grows with the zoom, and each step taken
+  // from it drifted further off the pointer
+  rect: () => videoEl.getBoundingClientRect(),
+  max: MAX_ZOOM,
+  busy: zoomBusy
+})
+const resetZoom = () => zoomer.reset()
+
+// a zoomed picture must not follow you to another camera or another moment
+$('camera').addEventListener('change', resetZoom)
+new ResizeObserver(applyZoom).observe(videoEl)
+
+// ---- full screen -------------------------------------------------------------
+//
+// The video and its controls go full screen together, not the picture alone: reviewing footage
+// means scrubbing, and a timeline you cannot reach is worse than a slightly smaller picture.
+
+const fullBtn = $('fullscreen')
+const fullTarget = document.body
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {})
+  else fullTarget.requestFullscreen?.().catch(() => {})
+}
+
+fullBtn?.addEventListener('click', toggleFullscreen)
+document.addEventListener('fullscreenchange', () => {
+  const on = Boolean(document.fullscreenElement)
+  document.body.classList.toggle('is-fullscreen', on)
+  if (fullBtn) {
+    fullBtn.setAttribute('aria-pressed', String(on))
+    fullBtn.title = on ? 'Leave full screen (F or Esc)' : 'Full screen (F)'
+    fullBtn.setAttribute('aria-label', on ? 'Leave full screen' : 'Full screen')
+  }
+  if (on) wakeControls()
+  else clearTimeout(idleTimer)
+  if (!on) fitPicture()
+  applyZoom() // the picture changed size, so the pan limits did too
+})
+if (!document.fullscreenEnabled && fullBtn) fullBtn.hidden = true
+
+// In full screen the controls float over the picture on glass, and step out of the way when the
+// mouse is still: after IDLE_MS they fade (and the cursor with them); any movement, touch or key
+// brings them back. Never while the pointer is on them or something in them has focus.
+const IDLE_MS = 3000
+const pbBar = document.querySelector('.pb-bar')
+
+// The picture's room: the height of the page's scrolling column less everything above the picture
+// (page header, picker row) and below it (the gap, the whole bar with its timeline). css/playback.css
+// turns it into the picture's width at 16:9, so on a laptop the picture, the bar and the timeline are
+// all on screen at once. Measured again whenever the window, the picker row or the bar change size.
+function fitPicture() {
+  const column = document.querySelector('.app-main')
+  const pbMain = document.querySelector('.pb-main')
+  if (!column || !pbMain || !pbBar || document.body.classList.contains('is-fullscreen')) return
+  const above = videoEl.getBoundingClientRect().top - column.getBoundingClientRect().top + column.scrollTop
+  const below = parseFloat(getComputedStyle(pbMain).paddingBottom) + pbBar.offsetHeight + parseFloat(getComputedStyle(pbBar).marginBottom)
+  document.body.style.setProperty('--pb-room', `${Math.max(0, Math.floor(column.clientHeight - above - below))}px`)
+}
+addEventListener('resize', fitPicture)
+{
+  const watch = new ResizeObserver(() => fitPicture())
+  for (const el of [pbBar, document.querySelector('.pb-picker'), document.querySelector('.page-head')]) if (el) watch.observe(el)
+}
+fitPicture()
+let idleTimer = 0
+function wakeControls() {
+  document.body.classList.remove('pb-idle')
+  clearTimeout(idleTimer)
+  idleTimer = setTimeout(() => {
+    if (!document.fullscreenElement) return
+    if (pbBar?.matches(':hover') || pbBar?.contains(document.activeElement)) return wakeControls()
+    document.body.classList.add('pb-idle')
+  }, IDLE_MS)
+}
+for (const ev of ['pointermove', 'pointerdown', 'keydown', 'touchstart']) {
+  document.addEventListener(ev, () => { if (document.fullscreenElement) wakeControls() }, { passive: true })
+}
+
+// ---- the export dialog -------------------------------------------------------
+//
+// Talks to /api/exports (export-api.mjs). The clip's times come from the two handles on the
+// timeline; the server trims to the nearest keyframes and records in the manifest what it
+// actually produced, which will differ by a second or two from what was asked for.
+
+const exportDlg = $('exportDlg')
+const exPeriod = $('exPeriod')
+const exClockWarn = $('exClockWarn')
+const exCameras = $('exCameras')
+const exName = $('exName')
+const exNotes = $('exNotes')
+// no password field yet: the export API does not accept one
+const exMsg = $('exMsg')
+const exProgress = $('exProgress')
+const exStart = $('exStart')
+
+const exSay = (text, bad = false) => {
+  exMsg.textContent = text
+  exMsg.className = `pb-ex-msg${bad ? ' pb-ex-bad' : ''}`
+}
+
+async function openExport() {
+  if (clip.from === null || clip.to === null) return
+  const secs = Math.round((clip.to - clip.from) / 1000)
+  // the clip's own day, not the day on screen (they differed after a change of day)
+  const clipDay = fmtDate(clip.from)
+  exPeriod.textContent = `${clipDay} · ${fmtTime(clip.from)} – ${fmtTime(clip.to)} (${Math.floor(secs / 60)} min ${secs % 60} s)`
+
+  // A wrong NVR clock is the sort of thing that gets evidence thrown out, so say it here rather
+  // than only burying it in the manifest.
+  const skew = Math.round((state.skew ?? 0) / 1000)
+  exClockWarn.hidden = Math.abs(skew) < 30
+  exClockWarn.textContent = exClockWarn.hidden
+    ? ''
+    : `This NVR's clock is ${Math.abs(skew)} s ${skew > 0 ? 'fast' : 'slow'}. The export records both times and the difference, so the real time can be shown.`
+
+  // every camera, with the one on screen already chosen
+  const cams = await fetch('/api/cameras').then((r) => (r.ok ? r.json() : [])).catch(() => [])
+  exCameras.replaceChildren(
+    ...cams.map((c) => {
+      const o = document.createElement('option')
+      o.value = `${c.nvr}/${c.ch}`
+      o.textContent = `${c.name} · ${c.nvrName}`
+      o.selected = c.nvr === state.nvr && c.ch === state.ch
+      return o
+    })
+  )
+
+  exName.value = `${clipDay} ${fmtTime(clip.from).slice(0, 5)} ${cameraSel.selectedOptions[0]?.textContent ?? 'export'}`
+  exNotes.value = ''
+  exProgress.hidden = true
+  exStart.disabled = false
+  exSay('')
+  exportDlg.showModal()
+}
+exportBtn.addEventListener('click', openExport)
+
+// ?markIn=ms&markOut=ms: a stretch to mark as the clip, and &export=1 to open the export dialog on it
+// (the Alarms page's Export button). Down here, not with ?t above, because the dialog's elements
+// must exist; the day has loaded by now (start, and ?t when the link has one). Only a stretch that
+// begins on the day shown: setClip keeps a clip inside that day, and would move any other into it.
+{
+  const markIn = Number(params.get('markIn'))
+  const markOut = Number(params.get('markOut'))
+  if (params.has('markIn') && params.has('markOut') && Number.isFinite(markIn) && Number.isFinite(markOut) && markIn > 0 && markOut > markIn && fmtDate(markIn) === state.date) {
+    setClip(markIn, markOut)
+    clipOn(true)
+    if (params.get('export') === '1') openExport()
+  }
+}
+
+exStart.addEventListener('click', async () => {
+  const cameras = [...exCameras.selectedOptions].map((o) => {
+    const [nvr, ch] = o.value.split('/')
+    return { nvr, ch: Number(ch) }
+  })
+  if (!cameras.length) return exSay('Choose at least one camera.', true)
+  const format = document.querySelector('input[name="exFormat"]:checked')?.value ?? 'pack'
+
+  exStart.disabled = true
+  exProgress.hidden = false
+  exProgress.value = 0
+  exSay('Starting…')
+  try {
+    const started = await fetch('/api/exports', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      // one clip per camera: the server takes each camera's own range, so a future version can
+      // export different moments per camera without changing the shape
+      body: JSON.stringify({
+        clips: cameras.map((c) => ({ nvr: c.nvr, ch: c.ch, fromMs: Math.round(clip.from), toMs: Math.round(clip.to) })),
+        format,
+        name: exName.value,
+        notes: exNotes.value
+      })
+    }).then(async (r) => {
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`)
+      return d
+    })
+    await followExport(started.id)
+  } catch (e) {
+    exSay(e.message, true)
+    exStart.disabled = false
+    exProgress.hidden = true
+  }
+})
+
+/** Polls until the export finishes, then offers it. */
+async function followExport(id) {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1000))
+    let job
+    try {
+      job = await fetch(`/api/exports/${encodeURIComponent(id)}`).then((r) => r.json())
+    } catch {
+      continue // a blip in polling is not a failed export
+    }
+    if (Number.isFinite(job.progress?.pct)) exProgress.value = job.progress.pct
+    if (job.state === 'done') {
+      exProgress.hidden = true
+      exSay('Ready.')
+      const a = document.createElement('a')
+      a.href = `/api/exports/${encodeURIComponent(id)}/download`
+      a.textContent = 'Download the export'
+      a.className = 'pb-ex-download'
+      exMsg.append(' ', a)
+      exStart.disabled = false
+      return
+    }
+    if (job.state === 'failed' || job.state === 'cancelled') {
+      exProgress.hidden = true
+      exSay(job.error ?? 'The export did not finish.', true)
+      exStart.disabled = false
+      return
+    }
+    exSay(job.progress?.message ?? job.progress?.step ?? 'Working…')
+  }
+}
+
+// ---- following someone from camera to camera ---------------------------------
+//
+// The cameras here are not smart: nothing detects a person and hands them over. What makes a
+// follow quick is simply knowing which camera adjoins which (camera-links.mjs, drawn on the site
+// map) and keeping the moment when you switch — which reloadKeepingPosition already does.
+//
+// Following is trial and error: you guess a direction, find nothing, and go back. So the back
+// step matters as much as the forward one, and it must return you to the moment you left, not to
+// wherever the other camera has since played on to.
+
+const followEl = $('follow')
+const followListEl = $('followList')
+const followBackEl = $('followBack')
+
+let cameraLinks = {} // "<nvr>/<ch>" -> [{ to, label }]
+let followSuggestions = [] // guesses from the map, never stored
+const followTrail = [] // where we came from: { nvr, ch, atMs }
+
+// the existing camKey() is for the camera on screen; this one names any camera
+const keyOf = (nvr, ch) => `${nvr}/${ch}`
+
+/** Whoever is in the camera list, by key, for names. */
+const cameraNameOf = (key) => {
+  const c = playbackCams.find((c) => keyOf(c.nvr, c.ch) === key)
+  if (c) return `${c.ch + 1} · ${c.name}${c.online ? '' : ' (offline)'}`
+  return key
+}
+
+async function loadCameraLinks() {
+  try {
+    const d = await api('/api/camera-links')
+    cameraLinks = d.links ?? {}
+    followSuggestions = d.suggestions ?? []
+  } catch {
+    cameraLinks = {} // without links the strip simply does not appear
+    followSuggestions = []
+  }
+  drawFollow()
+}
+
+function drawFollow() {
+  const key = keyOf(state.nvr, state.ch)
+  const links = cameraLinks[key] ?? []
+  // suggestions are guesses from the map: offered only when nothing has been drawn for this
+  // camera, and always labelled as guesses so nobody mistakes one for a known route
+  const guesses = links.length ? [] : followSuggestions.filter((s) => s.from === key)
+  const show = links.length > 0 || guesses.length > 0 || followTrail.length > 0
+  followEl.hidden = !show
+  followBackEl.hidden = followTrail.length === 0
+  if (!show) return
+
+  const button = (to, label, guess) => {
+    const b = document.createElement('button')
+    b.type = 'button'
+    b.className = `pb-follow-cam${guess ? ' pb-follow-guess' : ''}`
+    b.innerHTML = ''
+    const name = document.createElement('span')
+    name.className = 'pb-follow-name'
+    name.textContent = cameraNameOf(to)
+    const where = document.createElement('span')
+    where.className = 'pb-follow-where'
+    where.textContent = guess ? 'nearby on the map — not confirmed' : label || 'leads here'
+    b.append(name, where)
+    b.title = guess
+      ? `${cameraNameOf(to)} is close by on the map. Nobody has confirmed this route.`
+      : `Go to ${cameraNameOf(to)} at this moment${label ? ` — ${label}` : ''}`
+    b.addEventListener('click', () => followTo(to))
+    return b
+  }
+
+  followListEl.replaceChildren(
+    ...links.map((l) => button(l.to, l.label, false)),
+    ...guesses.map((s) => button(s.to, '', true))
+  )
+}
+
+/** Switch to a neighbouring camera, staying at the moment on screen. */
+async function followTo(key) {
+  const [nvr, ch] = key.split('/')
+  followTrail.push({ nvr: state.nvr, ch: state.ch, atMs: state.position })
+  await goToCamera(nvr, Number(ch), state.position)
+}
+
+followBackEl.addEventListener('click', async () => {
+  const back = followTrail.pop()
+  if (back) await goToCamera(back.nvr, back.ch, back.atMs)
+  drawFollow()
+})
+
+/** The camera switch the select does, but driven from code and with a moment to land on. */
+async function goToCamera(nvr, ch, atMs) {
+  leaveCamera() // (first: the new camera may have nothing to play at this moment)
+  state.nvr = nvr
+  state.ch = ch
+  fillCameraList(playbackCams, keyOf(nvr, ch))
+  cameraSel.value = keyOf(nvr, ch)
+  saveLastCamera(pageStorage, keyOf(nvr, ch))
+  history.replaceState(null, '', `?${nvrQ()}&ch=${ch}`)
+  clearSearch(true)
+  resetZoom()
+  if (Number.isFinite(atMs)) state.position = atMs
+  await reloadKeepingPosition()
+  drawFollow()
+}
+
+cameraSel.addEventListener('change', () => {
+  // choosing from the list is a fresh start, not a step in a follow
+  followTrail.length = 0
+  drawFollow()
+})
+
+// (not awaited in turn: these three are independent and were three round trips one after another)
+loadCameraLinks().catch(() => {})
+
+// The diamonds belong on the timeline whether or not the list beside the picture is open.
+loadBookmarks().catch(() => {})
+
+// ---- the on-screen display this app draws (osd-overlay.js) ---------------------------------------
+//
+// Drawn on a second canvas laid over the video canvas, not on the video canvas itself, because the
+// player owns that one and redraws it on every frame. It is drawn from this page rather than from
+// the shared render loop (player.js) on purpose: the streaming path stays exactly as it is and
+// knows nothing about overlays.
+//
+// The moment shown is state.position, written with state.tz — deliberately the very same arithmetic
+// the timeline, the clock box and the snapshot's file name use, so that everything on this page
+// agrees. In server mode that position is already the server's clock. In NVR mode it is the NVR's,
+// which is the clock that matches the footage being played; the settings panel says plainly which
+// clock the overlay follows so nobody reads it as the camera's own burnt-in stamp.
+
+const osdCanvas = videoEl.querySelector('canvas.osd')
+let osdSettings = { default: DEFAULT_OSD, cameras: {} }
+let osdSig = ''
+
+async function loadOsd() {
+  try {
+    const data = await api('/api/osd')
+    if (data?.default) osdSettings = { default: data.default, cameras: data.cameras ?? {} }
+  } catch {
+    // Not being able to read the overlay settings must never stop playback: the page simply draws
+    // the built-in default, which is the least surprising thing it can do.
+  }
+}
+
+/** This camera's overlay settings: its own where it has them, otherwise the site-wide default. */
+const osdSettingsNow = () => osdSettings.cameras[camKey()] ?? osdSettings.default
+
+/**
+ * The layout for the picture at its current size. `ctx` is used only to measure text, so the same
+ * layout can be produced for the canvas on screen and for a snapshot being saved.
+ */
+function osdLayoutNow(width, height, ctx) {
+  return osdLayout({
+    settings: osdSettingsNow(),
+    // The camera's own name as the picker shows it. A camera with no name draws no name line.
+    camera: { name: cameraSel.selectedOptions[0]?.textContent ?? '' },
+    atMs: state.position ?? null,
+    width,
+    height,
+    tzMs: state.tz,
+    measure: ctx
+      ? (text, fontPx) => {
+          ctx.font = osdFont(fontPx)
+          return ctx.measureText(text).width
+        }
+      : undefined
+  })
+}
+
+/** Paints the overlay, once a second, which is the resolution of the clock it shows. */
+function drawOverlay() {
+  if (!osdCanvas) return
+  const w = player.canvas.width
+  const h = player.canvas.height
+  if (osdIsOff(osdSettingsNow()) || !player.videoWidth || w < 2 || h < 2) {
+    if (osdSig !== '') {
+      osdCanvas.width = 0 // a zero-sized canvas draws nothing and costs nothing
+      osdSig = ''
+    }
+    return
+  }
+  const ctx = osdCanvas.getContext('2d')
+  if (!ctx) return
+  const layout = osdLayoutNow(w, h, ctx)
+  const sig = `${w}x${h}|${layout.lines.map((l) => `${l.text}@${Math.round(l.x)},${Math.round(l.y)}`).join('|')}`
+  if (sig === osdSig && osdCanvas.width === w) return
+  osdSig = sig
+  if (osdCanvas.width !== w || osdCanvas.height !== h) {
+    osdCanvas.width = w
+    osdCanvas.height = h
+  } else ctx.clearRect(0, 0, w, h)
+  drawOsd(ctx, layout)
+}
+
+loadOsd().catch(() => {})
+setInterval(drawOverlay, 1000)

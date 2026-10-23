@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <link rel="icon" href="/logo.svg" type="image/svg+xml" />
+  <!-- installable: Add to Home Screen opens Argus full screen, without the browser's bars -->
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/icon-180.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Argus" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0e1012" />
+  <title>Argus · Playback</title>
+  <script src="theme-boot.js"></script>
+  <link rel="stylesheet" href="css/tokens.css" />
+  <link rel="stylesheet" href="css/base.css" />
+  <link rel="stylesheet" href="css/components.css" />
+  <link rel="stylesheet" href="css/shell.css" />
+  <link rel="stylesheet" href="css/camera-browser.css" />
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="css/review.css" />
+  <link rel="stylesheet" href="css/playback.css" />
+</head>
+<body class="playback-page">
+  <!-- the page header (css/components.css). Above the toolbar, not in <main>: here <main> is the video -->
+  <header class="page-head"><div class="page-head-text"><h1>Playback</h1><p class="page-sub">Watch recordings, mark moments and save clips</p></div></header>
+  <!-- What to watch, in one slim row: one camera or many, the site (Browse, put in .pb-scope by
+       playback.js) and the camera. The day is chosen in the bar under the picture, which goes full
+       screen with it. -->
+  <header class="pb-picker">
+    <div class="pb-mode" role="group" aria-label="View">
+      <button type="button" aria-pressed="true">One camera</button>
+      <button type="button" id="modeMany" aria-pressed="false">Many cameras</button>
+    </div>
+    <div class="brand">
+      <h1>CCTV</h1>
+    </div>
+    <div class="controls">
+      <span class="pb-scope"></span>
+      <!-- the camera: shows the one being watched; type to find another (pb-picker.js) -->
+      <div class="pb-find">
+        <label for="playbackCameraSearch" class="visually-hidden">Camera</label>
+        <input id="playbackCameraSearch" type="text" role="combobox" aria-autocomplete="list" aria-expanded="false"
+               aria-controls="cameraList" autocomplete="off" spellcheck="false" placeholder="Find a camera" />
+        <svg class="icon pb-find-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        <ul id="cameraList" class="pb-find-list" role="listbox" aria-label="Cameras" hidden></ul>
+      </div>
+      <!-- the camera chosen, where the rest of the page reads it and listens for a change -->
+      <select id="camera" hidden aria-hidden="true" tabindex="-1"></select>
+    </div>
+    <span id="remoteMark" class="remote-mark" hidden title="You are connected through the internet, so the picture is converted and slower. On site, open the local address instead — it is faster.">through the internet</span>
+    <div class="account">
+      <span id="build" class="build" title="Running build"></span>
+      <span id="whoami"></span>
+      <button id="logout" type="button">Sign out</button>
+    </div>
+  </header>
+
+  <main class="pb-main">
+    <div class="tile pb-video" id="video">
+      <canvas></canvas>
+      <!-- This app's own on-screen display, drawn over the picture by playback.js (osd-overlay.js). -->
+      <canvas class="osd"></canvas>
+      <div class="pb-zoom-badge" id="zoomBadge" hidden></div>
+      <!-- until the first picture: the box already has its 16:9 size, with a quiet camera mark in it -->
+      <div class="pb-placeholder" id="pbPlaceholder" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3z"/></svg></div>
+      <pre class="stats"></pre>
+      <div class="pb-badge" id="srcBadge" hidden title="The server has not recorded this stretch: it plays from the NVR">from NVR</div>
+      <div class="pb-notice" id="pbNotice" role="status" hidden></div>
+      <div class="pb-spinner" id="spinner" hidden aria-hidden="true"></div>
+      <div class="pb-message" id="message" role="status" hidden></div>
+      <div class="pb-box-layer" id="boxLayer" hidden><div class="pb-box" id="box" hidden></div></div>
+    </div>
+    <aside class="pb-search" id="searchPanel" hidden aria-label="Motion search">
+      <h2>Motion search</h2>
+      <p class="pb-search-help" id="searchHelp">Drag a box on the picture around the area to watch.</p>
+      <label>Search
+        <select id="searchRange">
+          <option value="view">what the timeline shows</option>
+          <option value="hour">the hour before the playhead</option>
+          <option value="day">the whole day</option>
+        </select>
+      </label>
+      <label>Sensitivity
+        <select id="searchSens">
+          <option value="1">Low (big movement only)</option>
+          <option value="2" selected>Medium</option>
+          <option value="3">High (small movement)</option>
+        </select>
+      </label>
+      <div class="pb-search-actions">
+        <button id="searchGo" type="button" class="btn btn-primary" disabled>Search</button>
+        <button id="searchStop" type="button" hidden>Stop</button>
+        <button id="searchClear" type="button">Clear</button>
+      </div>
+      <div class="pb-progress" id="searchProgress" hidden><div></div></div>
+      <p class="pb-search-status" id="searchStatus"></p>
+      <ol class="pb-hits" id="searchHits"></ol>
+    </aside>
+
+    <!-- Bookmarks for this camera, beside the picture. Open with the Bookmarks button. -->
+    <aside class="pb-bookmarks" id="bookmarkPanel" hidden aria-label="Bookmarks">
+      <h2>Bookmarks</h2>
+      <label>Find
+        <input id="bookmarkFind" type="search" placeholder="title, notes or who marked it" />
+      </label>
+      <label class="pb-bm-scope">
+        <input id="bookmarkThisCamera" type="checkbox" checked /> this camera only
+      </label>
+      <button id="bookmarkAdd" type="button" class="btn btn-primary">Add a bookmark (B)</button>
+      <p class="pb-bm-status" id="bookmarkStatus"></p>
+      <ol class="pb-bm-list" id="bookmarkList"></ol>
+    </aside>
+  </main>
+
+  <section class="pb-bar pb-xp" aria-label="Playback controls">
+    <!-- 1. the one control bar: the day and the clock on the left, the playing controls in the middle,
+         Snapshot, Mark clip, Full screen and More on the right. Every button that was here before keeps its id, so playback.js and
+         the keyboard shortcuts find them where they always did. -->
+    <div class="pb-row pb-controls pb-xrow">
+      <div class="pb-xwhen">
+        <!-- the day, once: the arrows step it, the box picks any day -->
+        <span class="pb-day" role="group" aria-label="Day">
+          <button id="dayPrev" type="button" title="The day before" aria-label="Previous day">◀</button>
+          <input id="date" type="date" aria-label="Day" title="The day to watch" />
+          <button id="dayNext" type="button" title="The day after" aria-label="Next day">▶</button>
+        </span>
+        <!-- the clock is a button because clicking it (or T) turns it into the input beside it -->
+        <button id="clock" type="button" class="pb-clock" title="Click or press T to type a time">--:--:--</button>
+        <input id="clockInput" class="pb-clock-input" type="text" hidden inputmode="numeric"
+               aria-label="Go to time" placeholder="hh:mm:ss" />
+        <!-- jumps, not playing backwards: they move the playhead half a minute and carry on -->
+        <span class="pb-jumps" role="group" aria-label="Jump 30 seconds">
+          <button id="back" type="button" title="Jump back 30 seconds" aria-label="Jump back 30 seconds">−30s</button>
+          <button id="fwd" type="button" title="Jump forward 30 seconds" aria-label="Jump forward 30 seconds">+30s</button>
+        </span>
+      </div>
+
+      <div class="pb-transport" role="group" aria-label="Playing">
+        <button id="toStart" type="button" class="pb-icon pb-tbtn" title="Go to the first recording of this day (Home)" aria-label="Go to the first recording of this day"><svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 5v14" fill="none"/><path d="M19 6 10 12l9 6z"/></svg></button>
+        <button id="seqPrev" type="button" class="pb-icon pb-tbtn" title="Previous recording or motion (Shift+←)" aria-label="Previous recording or motion"><svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 6 3 12l8 6z"/><path d="M21 6l-8 6 8 6z"/></svg></button>
+        <button id="framePrev" type="button" class="pb-icon pb-tbtn" title="One frame back (,)" aria-label="One frame back"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 6 6 12l8 6z"/><path d="M18 6v12"/></svg></button>
+        <!-- only where the footage can really be played backwards (the server's own recordings):
+             playback.js hides it for the NVR's playback, which cannot -->
+        <button id="playBack" type="button" class="pb-icon pb-play pb-tbtn" hidden title="Play backwards (R)" aria-label="Play backwards"><svg class="icon i-play" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M17 6 8 12l9 6z"/></svg><svg class="icon i-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" aria-hidden="true"><path d="M8 6v12M16 6v12"/></svg></button>
+        <span class="pb-speed">
+          <input id="speedSlider" class="pb-speed-slider" type="range" min="0" max="3" value="0" step="1"
+                 title="Speed (&lt; slower, &gt; faster)" aria-label="Speed" />
+          <span id="speedText" class="pb-speed-text" aria-hidden="true">1×</span>
+        </span>
+        <button id="play" type="button" class="pb-icon pb-play pb-tbtn" title="Play (Space)" aria-label="Play"><svg class="icon i-play" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M7 6l9 6-9 6z"/></svg><svg class="icon i-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" aria-hidden="true"><path d="M8 6v12M16 6v12"/></svg></button>
+        <button id="frameNext" type="button" class="pb-icon pb-tbtn" title="One frame on (.)" aria-label="One frame on"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6v12"/><path d="M10 6l8 6-8 6z"/></svg></button>
+        <button id="seqNext" type="button" class="pb-icon pb-tbtn" title="Next recording or motion (Shift+→)" aria-label="Next recording or motion"><svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6l8 6-8 6z"/><path d="M13 6l8 6-8 6z"/></svg></button>
+        <button id="toEnd" type="button" class="pb-icon pb-tbtn" title="Go to the newest recording of this day (End)" aria-label="Go to the newest recording of this day"><svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 6l9 6-9 6z"/><path d="M18 5v14" fill="none"/></svg></button>
+      </div>
+
+      <div class="pb-tools">
+        <button id="snapshot" type="button" class="pb-capped pb-icon" title="Save the picture on screen" aria-label="Snapshot"><span class="pb-glyph"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h3l2-3h6l2 3h3v12H4z"/><circle cx="12" cy="13" r="3.5"/></svg></span><span class="pb-cap" aria-hidden="true">Snapshot</span></button>
+        <button id="selectClip" type="button" class="pb-capped pb-icon" title="Mark a clip to export ([ and ])" aria-label="Mark a clip" aria-pressed="false"><span class="pb-glyph"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M8 7.5 20 17M8 16.5 20 7"/></svg></span><span class="pb-cap" aria-hidden="true">Mark clip</span></button>
+        <button id="exportClip" type="button" class="btn-primary pb-export" title="Export the marked clip" disabled>Export</button>
+        <!-- Motion search: draw a box on the picture and find the movement inside it. On the bar, not under
+             More: the owner looked for it there (2026-10-12, and again for this layout). -->
+        <button id="searchToggle" type="button" class="pb-capped pb-icon" title="Draw a box on the picture and find movement inside it" aria-label="Motion search: draw a box" aria-pressed="false"><span class="pb-glyph"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="13" height="11" rx="1" stroke-dasharray="3 2.5"/><circle cx="17" cy="16" r="3"/><path d="m19.2 18.2 2.3 2.3"/></svg></span><span class="pb-cap" aria-hidden="true">Draw box</span></button>
+        <!-- Sound at a glance: lit while the camera's sound is on, and one click turns it on or off. The
+             Sound button in More does the same, with the volume and Filter beside it. -->
+        <button id="soundQuick" type="button" class="pb-icon pb-sound-quick" title="Listen to this camera's microphone as it was recorded" aria-label="Sound" aria-pressed="false"><svg class="icon i-sound-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg><svg class="icon i-sound-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="m17 9 5 6M22 9l-5 6"/></svg></button>
+        <button id="fullscreen" type="button" class="pb-capped pb-icon" title="Full screen (F)" aria-label="Full screen" aria-pressed="false"><span class="pb-glyph"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></span><span class="pb-cap" aria-hidden="true">Full screen</span></button>
+        <button id="moreBtn" type="button" class="pb-capped pb-icon" title="More controls" aria-label="More controls" aria-expanded="false" aria-controls="pbMore"><span class="pb-glyph"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="19" cy="12" r="1.3" fill="currentColor"/></svg></span><span class="pb-cap" aria-hidden="true">More</span></button>
+        <!-- More, beside its button: Bookmarks and Sound (with its volume and Filter), then speeds, quality, the shuttle and
+             the colour key. It floats over the picture (in full screen it opens inside the glass bar). -->
+        <div id="pbMore" class="pb-more" hidden>
+          <div class="pb-more-tools" role="group" aria-label="Tools">
+            <button id="bookmark" type="button" class="pb-capped pb-icon" title="Bookmarks (B)" aria-label="Bookmarks" aria-pressed="false"><span class="pb-glyph"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4z"/></svg></span><span class="pb-cap" aria-hidden="true">Bookmarks</span></button>
+            <!-- Sound: the camera's microphone as it was recorded (NVR playback, 1x only); volume and Filter while it is on, as on Live -->
+            <button id="soundBtn" type="button" class="pb-capped pb-icon" title="Listen to this camera's microphone as it was recorded" aria-label="Sound" aria-pressed="false"><span class="pb-glyph"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg></span><span class="pb-cap" aria-hidden="true">Sound</span></button>
+            <span id="soundExtras" class="pb-sound-extras" hidden>
+              <input id="soundVol" class="pb-sound-vol" type="range" min="0" max="2" step="0.05" value="1" title="Volume" aria-label="Sound volume" />
+              <button id="soundFilter" type="button" class="pb-sound-filter" aria-pressed="false" title="Reduce background noise: turns down hum, hiss and the quiet between sounds">Filter</button>
+            </span>
+          </div>
+          <div class="pb-more-row">
+            <span class="pb-more-label">Speed</span>
+            <div class="pb-speeds" id="speeds" role="group" aria-label="Speed"></div>
+          </div>
+          <div class="pb-more-row">
+            <label>Quality
+              <select id="quality" data-kind="nvr">
+                <option value="1">SD (light)</option>
+                <option value="0">HD</option>
+              </select>
+            </label>
+          </div>
+          <div class="pb-shuttle-row">
+            <input id="shuttle" class="pb-shuttle" type="range" min="-100" max="100" value="0" step="1"
+                   aria-label="Shuttle: push away from the middle to play faster" />
+            <span id="shuttleLabel" class="pb-shuttle-label">paused</span>
+          </div>
+          <div class="pb-legend">
+            <span class="lg-rec"></span> recorded
+            <span class="lg-evt"></span> motion / alarm
+            <span class="lg-hit"></span> movement in your box
+            <span class="lg-bm"></span> bookmark
+            <span id="legendServer" class="pb-legend-server" hidden><span class="lg-nvr"></span> from the NVR <span class="lg-gap"></span> not recorded</span>
+            <button id="shortcutsBtn" type="button" class="pb-shortcuts-btn" title="Keyboard shortcuts (?)">? shortcuts</button>
+            <span class="pb-hint" id="pbHint">Click the timeline to jump · scroll to zoom · drag to pan</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. the whole day, with the zoomed part marked; drag the marker to move the view -->
+    <div class="pb-overview" id="overview" aria-label="The whole day; drag the window to move the timeline">
+      <div class="pb-ov-boxes" id="ovBoxes"></div>
+      <div class="pb-ov-now" id="ovNow" hidden></div>
+      <div class="pb-ov-window" id="ovWindow"></div>
+    </div>
+
+    <!-- 3. the ruler: the clock times across the view, and on the playhead a pill saying exactly
+         which day and time is on screen. The line under the pill carries on down through the tracks. -->
+    <div class="pb-ruler" id="ruler">
+      <div class="pb-ticks" id="ticks" aria-hidden="true"></div>
+      <div class="pb-ruler-head" id="rulerHead" hidden></div>
+      <div class="pb-pill" id="pill" hidden title="The day and time under the playhead"></div>
+    </div>
+
+    <!-- 4. the tracks: recorded stretches above, motion below -->
+    <div class="pb-timeline" id="timeline" tabindex="0" role="group"
+         aria-label="Timeline: left and right arrows seek ten seconds; plus and minus zoom. Click to jump, drag the playhead to scrub, scroll to zoom, drag to pan">
+      <div class="pb-lane pb-lane-rec" id="laneRec"></div>
+      <div class="pb-lane pb-lane-motion" id="laneMotion"></div>
+      <div class="pb-now" id="tlNow" hidden></div>
+      <div class="pb-hoverline" id="hoverLine" hidden></div>
+      <div class="pb-hoverlabel" id="hoverLabel" hidden></div>
+      <div class="pb-clip-sel" id="clipSel" hidden></div>
+      <div class="pb-clip-handle pb-clip-from" id="clipFrom" hidden title="Drag: start of the clip"></div>
+      <div class="pb-clip-handle pb-clip-to" id="clipTo" hidden title="Drag: end of the clip"></div>
+      <!-- one diamond per bookmark in view, drawn by playback.js from bookmarks-view.js -->
+      <div class="pb-bm-marks" id="bookmarkMarks" aria-hidden="true"></div>
+      <div class="pb-playhead" id="playhead" hidden></div>
+    </div>
+
+    <!-- 5. under the tracks: Follow on the left, Playback | Live in the middle, and on the right
+         how much time the tracks show, with the four spans one click away -->
+    <div class="pb-row pb-under">
+      <div class="pb-under-left">
+        <button id="followBtn" type="button" aria-pressed="true" title="Keep the playhead on screen while it plays">Follow</button>
+        <span id="skewHint" class="pb-skew" hidden></span>
+      </div>
+      <nav class="pb-live-switch" aria-label="Playback or live">
+        <span class="pb-live-on" aria-current="page" title="You are watching recordings">Playback</span>
+        <a id="liveLink" href="/" title="Watch this camera live">Live</a>
+      </nav>
+      <div class="pb-under-right">
+        <span id="spanLabel" class="pb-span" title="How much time the timeline shows"></span>
+        <div class="pb-zoom" role="group" aria-label="How much time to show">
+          <button type="button" data-span="86400000" title="Show the whole day">24h</button>
+          <button type="button" data-span="3600000" title="Show one hour">1h</button>
+          <button type="button" data-span="600000" title="Show ten minutes">10m</button>
+          <button type="button" data-span="60000" title="Show one minute">1m</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Following someone: where this camera leads, at the moment on screen -->
+    <div class="pb-follow" id="follow" hidden>
+      <button type="button" id="followBack" class="pb-follow-back" hidden title="Back to the camera you came from">← Back</button>
+      <span class="pb-follow-title">Leads to</span>
+      <div class="pb-follow-list" id="followList"></div>
+    </div>
+
+
+    <dialog id="shortcuts" class="pb-shortcuts">
+      <h2>Keyboard shortcuts</h2>
+      <dl>
+        <dt>Space</dt><dd>play or pause</dd>
+        <dt>← →</dt><dd>back or on 10 s</dd>
+        <dt>Shift + ← →</dt><dd>previous or next recording or motion</dd>
+        <dt>Home End</dt><dd>first or newest recording of the day</dd>
+        <dt>, .</dt><dd>one frame back or on</dd>
+        <dt>R</dt><dd>play backwards (the server's own recordings only)</dd>
+        <dt>&lt; &gt;</dt><dd>slower or faster</dd>
+        <dt>+ −</dt><dd>zoom in or out</dd>
+        <dt>0</dt><dd>show the whole day</dd>
+        <dt>T</dt><dd>type a time to go to</dd>
+        <dt>F</dt><dd>full screen</dd>
+        <dt>B</dt><dd>bookmark this moment</dd>
+        <dt>[ ]</dt><dd>start and end of the clip to export</dd>
+        <dt>D</dt><dd>show the decoder statistics</dd>
+        <dt>?</dt><dd>this list</dd>
+      </dl>
+      <button id="shortcutsClose" type="button">Close</button>
+    </dialog>
+
+    <dialog id="exportDlg" class="pb-export">
+      <form method="dialog">
+        <h2>Export clip</h2>
+        <p class="pb-ex-period" id="exPeriod"></p>
+        <p class="pb-ex-warn" id="exClockWarn" hidden></p>
+
+        <label>Cameras
+          <select id="exCameras" multiple size="4"></select>
+        </label>
+        <p class="pb-hint">Hold Ctrl to pick more than one, for the same moment from several angles.</p>
+
+        <fieldset class="pb-ex-formats">
+          <legend>Format</legend>
+          <label><input type="radio" name="exFormat" value="pack" checked> <b>Evidence pack</b> — the original video, signed, with a player. Best for the police or an insurer.</label>
+          <label><input type="radio" name="exFormat" value="mp4"> <b>MP4</b> — plays anywhere, signed alongside.</label>
+          <label><input type="radio" name="exFormat" value="stills"> <b>Stills</b> — one picture every few seconds.</label>
+        </fieldset>
+
+        <label>Name <input id="exName" maxlength="120" /></label>
+        <label>Notes <input id="exNotes" maxlength="500" placeholder="Shown when the export is opened" /></label>
+        <!-- A password would encrypt the pack. The plumbing exists but the export API does not take one yet, so the field is not shown rather than pretending it protects anything. -->
+
+        <p class="pb-ex-msg" id="exMsg"></p>
+        <progress id="exProgress" max="100" value="0" hidden></progress>
+        <div class="pb-ex-actions">
+          <button type="submit" value="cancel">Close</button>
+          <button type="button" id="exStart" class="btn btn-primary">Create export</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Adding or editing one bookmark. The times are filled in from the timeline and can be typed
+         over; the page checks them with the same rules the server uses (bookmarks-view.js). -->
+    <dialog id="bmDlg" class="pb-bm-dialog">
+      <form method="dialog">
+        <h2 id="bmTitleHeading">Bookmark</h2>
+        <label>Title
+          <input id="bmTitle" type="text" maxlength="120" placeholder="What happened" />
+        </label>
+        <div class="pb-bm-times">
+          <label>From <input id="bmFrom" type="text" inputmode="numeric" placeholder="hh:mm:ss" /></label>
+          <label>To <input id="bmTo" type="text" inputmode="numeric" placeholder="hh:mm:ss" /></label>
+        </div>
+        <p class="pb-hint" id="bmDay"></p>
+        <label>Cameras
+          <select id="bmCameras" multiple size="4"></select>
+        </label>
+        <p class="pb-hint">Hold Ctrl to mark the same moment on more than one camera.</p>
+        <label>Notes
+          <textarea id="bmNotes" rows="3" maxlength="2000"></textarea>
+        </label>
+        <p class="pb-ex-msg" id="bmMsg"></p>
+        <div class="pb-ex-actions">
+          <button type="submit" value="cancel">Cancel</button>
+          <button type="button" id="bmSave" class="btn btn-primary">Save</button>
+        </div>
+      </form>
+    </dialog>
+  </section>
+
+  <script type="module" src="shell.js"></script>
+  <script type="module" src="playback.js"></script>
+  <script type="module" src="alert-banner.js"></script>
+  <script type="module" src="build-badge.js"></script>
+</body>
+</html>

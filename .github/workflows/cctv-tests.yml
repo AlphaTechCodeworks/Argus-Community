@@ -1,0 +1,117 @@
+name: CCTV tests (Linux)
+
+# The cctv app's own tests are standalone node scripts (cctv/test/*.test.mjs, a custom check()
+# harness), not the library's vitest suite. They load the native TVT SDK through koffi
+# (cctv/sdk.mjs -> bin/linux/*.so) and import the compiled library structs from build/ (produced by
+# `npm run build`), so they need Linux, a build, and bin/linux on the library path. A few need a
+# browser runtime (WebCodecs VideoDecoder) that node has no equivalent for and are skipped here.
+on:
+  workflow_dispatch: # lets an admin run it by hand from the Actions tab (on any branch)
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+
+jobs:
+  cctv-tests:
+    name: cctv app tests (node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 24
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install ffmpeg (several tests shell out to ffmpeg/ffprobe)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      # Argus Community ships with no OCR code (owner's rule): fail on any OCR engine, page, route or wording.
+      # TVT's own SDK manuals and headers (docs/include, docs/demo, docs/html) and binaries (bin/) are not ours.
+      - name: No OCR code in Argus Community
+        run: |
+          pattern='\bocr\b|vaxtor|metrici|glyph.?network|container[- ]code|container-read|plate-read|watch ?list|owner register|iso ?6346|ocr-test|/api/ocr|internal/reads'
+          if git grep -nIiE "$pattern" -- . ':!docs/include' ':!docs/demo' ':!docs/html' ':!bin' ':!.github/workflows/cctv-tests.yml'; then
+            echo "::error::OCR code or wording found (above). Argus Community must not contain any OCR."
+            exit 1
+          fi
+      # ...nor any of Argus Pro's smart (AI) features: their modules, screens and routes stay out.
+      - name: No smart (AI) features in Argus Community
+        run: |
+          pro='(^|/)(detect[a-z-]*|stay-rules|zones|zone-rules|smart-modules|counts-db|reads|watchlist|pro-crypto|pro-manifest|pro-loader|ai-boxes|detect-switch|zones-panel|reports-counts|smart-modules-settings|watchlist-panel|sign-licence[a-z-]*|build-pro-bundle|install-detect)\.(mjs|js)$'
+          if git ls-files | grep -E "$pro"; then
+            echo "::error::Argus Pro smart-feature files found (above). Argus Community must not contain them."
+            exit 1
+          fi
+          routes='/api/detect|/api/smart|/api/zones|/api/admin/counts|/api/watchlist|yolox|onnxruntime'
+          if git grep -nIiE "$routes" -- cctv deploy package.json; then
+            echo "::error::Argus Pro smart-feature routes or the AI model found (above)."
+            exit 1
+          fi
+      - run: npm ci
+
+      # cctv/sdk.mjs imports the compiled library structs from build/lib (gitignored); build them first
+      - run: npm run build
+
+      - name: Run cctv app test suite
+        env:
+          # the TVT SDK .so and its siblings (libShareLib, libNatClientSDK, ...) live here
+          LD_LIBRARY_PATH: ${{ github.workspace }}/bin/linux
+          DATA_DIR: ${{ runner.temp }}/cctv-data
+        run: |
+          mkdir -p "$DATA_DIR"
+          shopt -s nullglob
+          # Never run here:
+          #   live-replay, player, playout-speed  need a browser runtime (WebCodecs VideoDecoder)
+          #   sps, substreams                     read lab captures from /work that are not in the repo
+          skip=" live-replay.test.mjs player.test.mjs playout-speed.test.mjs sps.test.mjs substreams.test.mjs "
+          # Run and reported, but not gating until they are fixed on Linux (none now):
+          known=" "
+          pass=0
+          fail=0
+          skipped=0
+          failed=()
+          knownfailed=()
+          for f in cctv/test/*.test.mjs; do
+            b=$(basename "$f")
+            case "$skip" in
+              *" $b "*) echo "skip $f"; skipped=$((skipped + 1)); continue ;;
+            esac
+            echo "::group::$f"
+            if timeout 300 node "$f"; then
+              pass=$((pass + 1))
+            else
+              code=$?
+              case "$known" in
+                *" $b "*)
+                  echo "::warning file=$f::$f failed (exit $code): known failing on Linux CI, not gating"
+                  knownfailed+=("$f")
+                  ;;
+                *)
+                  echo "::error file=$f::$f failed (exit $code)"
+                  fail=$((fail + 1))
+                  failed+=("$f")
+                  ;;
+              esac
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "## cctv tests: $pass passed, $fail failed, ${#knownfailed[@]} known failing (not gating), $skipped skipped"
+            for f in "${failed[@]}"; do echo "- FAILED $f"; done
+            for f in "${knownfailed[@]}"; do echo "- known failing: $f"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "passed: $pass  failed: $fail  known failing: ${#knownfailed[@]}  skipped: $skipped"
+          test "$fail" -eq 0

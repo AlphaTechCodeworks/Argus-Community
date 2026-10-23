@@ -1,0 +1,58 @@
+.health-page main.health { max-width: 1500px; width: 100%; padding: 24px; gap: 20px; box-sizing: border-box; }
+.health-page button, .health-page input { min-height: 44px; }
+.health-page button:focus-visible, .health-page input:focus-visible, .health-page summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.health-fresh { color: var(--ok-text); }
+.health-stale { color: var(--text); background: var(--warn-soft); border-left: 4px solid var(--warn); padding: 12px; }
+.health-page .hp-hero { padding: 20px; border-radius: var(--r-lg); }
+.health-page .hp-hero-tags { max-height: 180px; overflow: auto; }
+.health-page .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; }
+.health-page .card { padding: 18px; border-radius: var(--r-md); }
+.health-page .card .note { font-size: var(--fs-dense); line-height: 1.5; }
+.health-filters { display: flex; align-items: end; flex-wrap: wrap; gap: 20px; padding: 16px; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); }
+.health-filters label { display: grid; gap: 8px; }
+.health-filters input[type=search] { min-width: 280px; }
+.health-filters .health-issues { display: flex; align-items: center; min-height: 44px; }
+.health-issues input { width: 20px; }
+#healthResults { color: var(--text-muted); padding-bottom: 12px; }
+.health-pager { display: flex; gap: 16px; align-items: center; justify-content: flex-end; }
+.health-page .nvr-sum { padding: 18px; }
+.health-page .hp-history { overflow: auto; }
+/* "Last 24 hours" (metrics-view.js): small line charts drawn as SVG by health.js. Colours are the
+   tokens, so both themes are covered; each line also has its own dash, and its name and figures
+   are in the legend under the chart, so nothing is told by colour alone. */
+.mv-switch { display: flex; gap: 8px; margin: 12px 0; }
+.mv-switch button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.mv-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.mv-chart { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); padding: 14px; min-width: 0; }
+.mv-chart h3 { margin: 0 0 4px; font-size: var(--fs-body); }
+.mv-chart svg { display: block; width: 100%; height: auto; }
+.mv-chart .mv-grid { stroke: var(--border); stroke-width: 1; }
+.mv-chart text { fill: var(--text-muted); font-size: var(--fs-meta); font-family: var(--font); }
+.mv-line { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.mv-dot { stroke: none; }
+.mv-a { stroke: var(--accent); } .mv-dot.mv-a, .mv-key.mv-a { fill: var(--accent); background: var(--accent); }
+.mv-b { stroke: var(--ok); stroke-dasharray: 6 3; } .mv-dot.mv-b, .mv-key.mv-b { fill: var(--ok); background: var(--ok); }
+.mv-c { stroke: var(--warn); stroke-dasharray: 2 3; } .mv-dot.mv-c, .mv-key.mv-c { fill: var(--warn); background: var(--warn); }
+.mv-d { stroke: var(--bad); } .mv-dot.mv-d, .mv-key.mv-d { fill: var(--bad); background: var(--bad); }
+.mv-e { stroke: var(--text); stroke-dasharray: 10 3 2 3; } .mv-dot.mv-e, .mv-key.mv-e { fill: var(--text); background: var(--text); }
+.mv-f { stroke: var(--accent); stroke-dasharray: 1 3; stroke-linecap: round; } .mv-dot.mv-f, .mv-key.mv-f { fill: var(--accent); background: var(--accent); }
+.mv-limit { stroke: var(--text-muted); stroke-dasharray: 8 4; stroke-width: 1.2; } .mv-dot.mv-limit, .mv-key.mv-limit { fill: var(--text-muted); background: var(--text-muted); }
+.mv-legend { list-style: none; margin: 8px 0 6px; padding: 0; display: grid; gap: 4px; font-size: var(--fs-dense); color: var(--text); }
+.mv-key { display: inline-block; width: 14px; height: 3px; border-radius: var(--r-sm); margin-right: 8px; vertical-align: middle; }
+.mv-top-head { margin: 16px 0 6px; font-size: var(--fs-body); }
+.mv-top { margin: 0 0 8px; padding-left: 20px; font-size: var(--fs-dense); line-height: 1.7; }
+@media (max-width: 700px) {
+  .health-page main.health { padding: 16px; }
+  .health-filters > label { width: 100%; }
+  .health-filters input[type=search] { min-width: 0; width: 100%; box-sizing: border-box; }
+  .health-page .nvr-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .health-page .nvr-sum-head { flex-wrap: wrap; }
+}
+/* the pager is hidden when there is one page; its display:flex would otherwise win over [hidden] */
+.health-pager[hidden] { display: none; }
+/* a recorder with no disk or load figures says so once, across the three places the figures go */
+.health-page .nvr-stat-missing { grid-column: 2 / -1; align-self: center; }
+/* "Technical details": its two folds carry an h3, with the same arrow as the h2 folds */
+.hp-history > summary h3 { display: inline-flex; align-items: center; gap: 8px; margin: 8px 0; }
+.hp-history > summary h3::before { content: "▸"; color: var(--text-muted); font-size: 0.8em; transition: transform var(--t-fast); }
+.hp-history[open] > summary h3::before { transform: rotate(90deg); }

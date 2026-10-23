@@ -1,0 +1,26 @@
+/* Sites: a card per recorder (sites.js: the recorder's row and its Cameras dropdown together).
+   Narrower than 1100px the cards stack in one box, as before; from 1100px they sit two to a row so a
+   wide screen is used, not only its left half. Colours, sizes and corners come from tokens.css. */
+.st-nvr-card { min-width: 0; }
+.st-nvr-card + .st-nvr-card { border-top: 1px solid var(--border); }
+/* the Cameras dropdown lines up under the recorder's name, not against the box's edge */
+.st-nvr-card > .st-cameras { margin: 0; padding: 0 var(--s4) var(--s2) calc(var(--s4) + 12px + 14px); }
+
+/* the sub-stream warning: one short line, its Fix button beside it (wrapping under it on a phone) */
+.st-subs-warn { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); }
+.st-nvr-main .st-subs-warn { overflow: visible; }
+.st-subs-warn > span { min-width: 0; overflow-wrap: anywhere; }
+/* small on a desk, finger-sized on a phone */
+@media (max-width: 599px) { .st-subs-warn > button { min-height: 44px; } }
+
+@media (min-width: 1100px) {
+  .sites-page .st-main { max-width: 1600px; }
+  .st-nvrs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s3);
+    background: none; border: 0; border-radius: 0; overflow: visible; }
+  .st-nvr-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
+  /* half the width: the buttons go under the name and camera count instead of squeezing the name */
+  .st-nvr { grid-template-columns: 12px minmax(0, 1fr) minmax(6rem, 9rem); }
+  .st-nvr-actions { grid-column: 2 / -1; justify-content: flex-start; flex-wrap: wrap; }
+  /* a camera's settings editor needs the room: its card takes the whole row while it is open */
+  .st-nvr-card:has(.st-cameras[open]) { grid-column: 1 / -1; }
+}

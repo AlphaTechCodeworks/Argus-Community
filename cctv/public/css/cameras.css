@@ -1,0 +1,35 @@
+/* Cameras: one compact row per camera (cameras.js draws them). Narrow screens get a card per
+   camera, its lines wrapping so nothing is ever wider than the screen; from 700px the cards close up
+   into a list, two lines each, the IP lined up on the right. What the old table's other columns said
+   is in each row's tooltip and in the Excel download. Colours, sizes and corners come from tokens.css. */
+.cm-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--s2); }
+.cm-row { display: grid; grid-template-columns: 10px minmax(0, 1fr); grid-template-areas: "dot name" ". detail" ". ip";
+  align-items: center; gap: var(--s1) var(--s3); padding: var(--s3); min-width: 0;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); }
+.cm-dot { grid-area: dot; width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
+.cm-dot.is-on { background: var(--ok); }
+.cm-dot.is-off { background: var(--bad); }
+.cm-name { grid-area: name; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--s2); min-width: 0; }
+.cm-name b { font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.cm-where { color: var(--text-muted); font-size: var(--fs-dense); overflow-wrap: anywhere; }
+.cm-detail { grid-area: detail; color: var(--text-faint); font-size: var(--fs-dense); overflow-wrap: anywhere; }
+.cm-detail:empty { display: none; }
+.cm-ip { grid-area: ip; color: var(--text-muted); font-size: var(--fs-dense); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.cm-ip:empty { display: none; }
+/* a camera that is offline is dimmed; a recorder that did not answer reads as a note */
+.cm-camoff > :not(.cm-dot) { opacity: .6; }
+.cm-off .cm-name b { font-weight: 400; font-style: italic; color: var(--text-muted); }
+.cm-empty { padding: var(--s4); color: var(--text-faint); text-align: center; }
+
+/* a wider screen: a list in one box, a row per camera, the name line over the quieter detail line */
+@media (min-width: 700px) {
+  .cm-list { gap: 0; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); }
+  .cm-row { grid-template-columns: 10px minmax(0, 1fr) minmax(7rem, auto); grid-template-areas: "dot name ip" "dot detail ip";
+    gap: 2px var(--s3); padding: var(--s2) var(--s3); background: none; border: 0; border-top: 1px solid var(--border); border-radius: 0; }
+  .cm-row:first-child { border-top: 0; }
+  .cm-row:hover { background: var(--surface-hover); }
+  .cm-name { flex-wrap: nowrap; overflow: hidden; white-space: nowrap; }
+  .cm-name b, .cm-where, .cm-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; }
+  .cm-name b { flex: none; max-width: 60%; }
+  .cm-ip { text-align: right; }
+}

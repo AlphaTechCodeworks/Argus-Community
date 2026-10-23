@@ -1,0 +1,217 @@
+/* The frame: sidebar, rail, phone bar. Pages keep their own layout inside .app-main. */
+/* Exactly the window's height, the main column scrolling inside it: pages built to fit the window
+   (Live, Playback, Wall) keep fitting it -- with only a minimum height, Playback's video grew and
+   pushed its controls off the bottom -- and long pages scroll with the sidebar staying put. */
+body.has-shell { display: grid; grid-template-columns: var(--shell-w) minmax(0, 1fr); height: 100vh; height: 100dvh; overflow: hidden; margin: 0; }
+body.has-shell .app-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: auto; }
+
+.app-shell { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; padding: var(--s4) var(--s3);
+  background: var(--surface-1); border-right: 1px solid var(--border); overflow-y: auto; overflow-x: hidden; }
+.shell-brand { display: flex; align-items: center; gap: var(--s3); padding: 2px var(--s2) var(--s5); color: var(--text);
+  font-weight: 600; font-size: var(--fs-section); text-decoration: none; }
+.shell-logo { width: 40px; height: 40px; border-radius: var(--r-md); display: block; flex-shrink: 0; }
+.shell-brand-type { display: flex; flex-direction: column; gap: 3px; }
+.shell-brand-type strong { font-size: var(--fs-title); line-height: 1.1; letter-spacing: -0.04em; font-weight: 700; }
+.shell-brand-type small { color: var(--text-muted); font-size: var(--fs-meta); font-weight: 500; letter-spacing: 0.02em; }
+.shell-nav a[aria-current="page"] { background: var(--accent-soft); color: var(--accent-strong); box-shadow: inset 3px 0 var(--accent); }
+.shell-logo .icon { width: 18px; height: 18px; }
+.shell-group-label { font-size: var(--fs-meta); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint);
+  padding: var(--s4) var(--s3) var(--s2); }
+.shell-nav a { display: flex; align-items: center; gap: var(--s3); padding: 9px var(--s3); border-radius: var(--r-md); color: var(--text-muted);
+  font-weight: 500; text-decoration: none; transition: background var(--t-fast), color var(--t-fast); }
+.shell-nav a:hover { background: var(--surface-hover); color: var(--text); }
+.shell-nav a[aria-current="page"] { background: var(--surface-3); color: var(--text); }
+.shell-nav a[aria-current="page"] .icon { color: var(--accent-strong); }
+.shell-nav .icon, .shell-foot .icon, .shell-pin .icon { display: block; width: 22px; height: 22px; flex: 0 0 22px; }
+.shell-foot { margin-top: auto; padding-top: var(--s3); border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: var(--s2); }
+.shell-theme { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3); border: 0; background: none;
+  color: var(--text-muted); font: 500 var(--fs-dense) var(--font); border-radius: var(--r-sm); cursor: pointer; text-align: left; }
+.shell-theme:hover { background: var(--surface-hover); color: var(--text); }
+.shell-user { display: flex; align-items: center; gap: var(--s2); padding: var(--s1) var(--s2); }
+.shell-avatar { width: 32px; height: 32px; flex: none; border-radius: 50%; display: grid; place-items: center; background: var(--surface-2);
+  font-weight: 600; font-size: var(--fs-dense); }
+.shell-who { flex: 1; min-width: 0; font-size: var(--fs-dense); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shell-who small { display: block; color: var(--text-faint); font-size: var(--fs-meta); }
+.shell-bar, .shell-sheet { display: none; }
+.shell-pin { display: flex; align-items: center; gap: var(--s3); min-height: 44px; margin-bottom: var(--s2); padding: var(--s2) var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-2); color: var(--text-muted); font: inherit; cursor: pointer; }
+.shell-pin[aria-pressed="true"] { color: var(--accent-strong); border-color: var(--accent); }
+.shell-settings-status { min-height: 0; width: 100%; overflow-wrap: anywhere; font-size: var(--fs-meta); color: var(--text-muted); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 4px; }
+.shell-settings-status[hidden] { display: none; }
+.alert-banner[hidden] { display: none !important; }
+/* open problems (alert-banner.js): the bell turns red, with a dot, wherever the shell draws it */
+body.has-problems a[href="/alarms.html"] .icon { color: var(--bad); }
+body.has-problems a[href="/alarms.html"] { position: relative; }
+body.has-problems a[href="/alarms.html"]::after { content: ''; position: absolute; top: 6px; left: 26px; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+.alert-dismiss { min-width: 44px; min-height: 44px; padding: 8px 12px; border: 1px solid currentColor; border-radius: var(--r-sm); background: transparent; color: inherit; cursor: pointer; }
+.alert-dismiss:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* the old page header's brand and tab strip are replaced by the shell */
+body.has-shell header .brand h1, body.has-shell header nav.tabs, body.has-shell header .account { display: none; }
+
+/* tablet: an icon rail; labels live in the tooltips */
+@media (max-width: 1199px) {
+  body.has-shell { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
+  .app-shell { padding: var(--s4) var(--s2); align-items: center; }
+  .shell-brand span:last-child, .shell-nav a span, .shell-group-label, .shell-theme span, .shell-who { display: none; }
+  .shell-brand { padding: 0 0 var(--s4); }
+  .shell-nav a { justify-content: center; width: 44px; height: 44px; padding: 0; }
+  .shell-group + .shell-group { border-top: 1px solid var(--border); margin-top: var(--s2); padding-top: var(--s2); }
+  .shell-foot { align-items: center; }
+  .shell-user { flex-direction: column; }
+}
+
+/* phone: content full width, a bar along the bottom */
+/* Auto-hide to a stable icon rail. Expanding overlays the workspace so video and maps do not resize. */
+@media (min-width: 700px) {
+  body.has-shell { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
+  body.has-shell .app-main { grid-column: 2; }
+  body.has-shell .app-shell { position: fixed; left: 0; top: 0; z-index: 60; width: var(--rail-w); height: 100dvh; box-sizing: border-box; padding: var(--s4) var(--s2); align-items: center; transition: width var(--t-fast); }
+  body.has-shell .app-shell { overflow: hidden; }
+  .app-shell .shell-nav { flex: 1; min-height: 0; width: 100%; overflow-y: auto; overflow-x: hidden; scrollbar-width: none; }
+  .app-shell .shell-foot { flex-shrink: 0; }
+  .app-shell .shell-brand-type, .app-shell .shell-nav a span, .app-shell .shell-group-label, .app-shell .shell-theme span, .app-shell .shell-who, .app-shell .shell-pin-label { display: none; }
+  .app-shell .shell-brand { flex: 0 0 72px; height: 72px; box-sizing: border-box; padding: 0 0 var(--s4); }
+  .app-shell .shell-group-label { display: block; visibility: hidden; height: 28px; box-sizing: border-box; padding: 8px var(--s3) 4px; }
+  .app-shell .shell-nav a { justify-content: center; width: 100%; min-height: 44px; height: 44px; padding: 0; }
+  .app-shell .shell-group + .shell-group { border-top: 1px solid var(--border); margin-top: var(--s2); padding-top: var(--s2); }
+  .app-shell .shell-foot { align-items: center; }
+  .app-shell .shell-theme { width: 44px; height: 44px; padding: 0; justify-content: center; }
+  .app-shell .shell-user { padding-inline: 0; }
+  .app-shell .shell-user [data-sign-out] { width: 44px; height: 44px; display: grid; place-items: center; }
+  .app-shell .shell-user { flex-direction: column; }
+  .app-shell .shell-pin { width: 44px; justify-content: center; padding: 8px; flex-shrink: 0; }
+  body.has-shell.sidebar-pinned { grid-template-columns: var(--shell-w) minmax(0, 1fr); }
+  body.has-shell .app-shell:is(:hover, :focus-within), body.has-shell.sidebar-pinned .app-shell { width: var(--shell-w); align-items: stretch; padding: var(--s4) var(--s3); box-shadow: var(--shadow); }
+  .app-shell:is(:hover, :focus-within) .shell-brand-type, .sidebar-pinned .app-shell .shell-brand-type { display: flex; }
+  .app-shell:is(:hover, :focus-within) :is(.shell-nav a span, .shell-group-label, .shell-theme span, .shell-who, .shell-pin-label), .sidebar-pinned .app-shell :is(.shell-nav a span, .shell-group-label, .shell-theme span, .shell-who, .shell-pin-label) { display: block; }
+  .app-shell:is(:hover, :focus-within) .shell-nav a, .sidebar-pinned .app-shell .shell-nav a { width: auto; justify-content: flex-start; padding: 9px var(--s3); }
+  .app-shell:is(:hover, :focus-within) .shell-group-label, .sidebar-pinned .app-shell .shell-group-label { visibility: visible; }
+  .app-shell:is(:hover, :focus-within) .shell-nav, .sidebar-pinned .app-shell .shell-nav { scrollbar-width: thin; }
+  .app-shell:is(:hover, :focus-within) .shell-brand, .sidebar-pinned .app-shell .shell-brand { padding: 0 var(--s2) var(--s4); }
+  .app-shell:is(:hover, :focus-within) .shell-foot, .sidebar-pinned .app-shell .shell-foot { align-items: stretch; }
+  .app-shell:is(:hover, :focus-within) .shell-theme, .sidebar-pinned .app-shell .shell-theme { width: auto; justify-content: flex-start; padding-inline: var(--s3); }
+  .app-shell:is(:hover, :focus-within) .shell-user, .sidebar-pinned .app-shell .shell-user { flex-direction: row; }
+  .app-shell:is(:hover, :focus-within) .shell-pin, .sidebar-pinned .app-shell .shell-pin { width: auto; justify-content: flex-start; padding: var(--s2) var(--s3); }
+}
+
+/* Keep a fixed inner canvas: only the clipping frame moves, so icons never jump
+   and labels can fade in both directions instead of switching display states. */
+@media (min-width: 700px) {
+  body.has-shell .app-shell,
+  body.has-shell .app-shell:is(:hover, :focus-within),
+  body.has-shell.sidebar-pinned .app-shell {
+    padding: var(--s4) var(--s2);
+    align-items: flex-start;
+    transition: width 300ms cubic-bezier(.22, 1, .36, 1), box-shadow 300ms ease;
+  }
+  .app-shell .shell-nav, .app-shell .shell-foot,
+  .app-shell .shell-brand, .app-shell .shell-pin {
+    width: calc(var(--shell-w) - 17px);
+    flex-shrink: 0;
+    box-sizing: border-box;
+  }
+  .app-shell .shell-brand,
+  .app-shell:is(:hover, :focus-within) .shell-brand,
+  .sidebar-pinned .app-shell .shell-brand { padding: 0 8px var(--s4); }
+  .app-shell .shell-nav a,
+  .app-shell:is(:hover, :focus-within) .shell-nav a,
+  .sidebar-pinned .app-shell .shell-nav a,
+  .app-shell .shell-theme,
+  .app-shell:is(:hover, :focus-within) .shell-theme,
+  .sidebar-pinned .app-shell .shell-theme {
+    width: 100%; justify-content: flex-start; padding: 9px 11px; box-sizing: border-box;
+  }
+  .app-shell .shell-pin,
+  .app-shell:is(:hover, :focus-within) .shell-pin,
+  .sidebar-pinned .app-shell .shell-pin { justify-content: flex-start; padding: 8px 10px; }
+  .app-shell .shell-foot,
+  .app-shell:is(:hover, :focus-within) .shell-foot,
+  .sidebar-pinned .app-shell .shell-foot { align-items: stretch; }
+  .app-shell .shell-user,
+  .app-shell:is(:hover, :focus-within) .shell-user,
+  .sidebar-pinned .app-shell .shell-user { flex-direction: row; position: relative; height: 88px; align-items: flex-start; padding: 4px 6px; box-sizing: border-box; }
+  .app-shell .shell-user [data-sign-out] { position: absolute; bottom: 0; left: 0; }
+  .app-shell .shell-brand-type { display: flex; }
+  .app-shell :is(.shell-nav a span, .shell-group-label, .shell-theme span, .shell-who, .shell-pin-label) { display: block; }
+  .app-shell :is(.shell-brand-type, .shell-nav a span, .shell-group-label, .shell-theme span, .shell-who, .shell-pin-label) {
+    opacity: 0; visibility: hidden; white-space: nowrap;
+    transition: opacity 180ms ease, visibility 0s linear 180ms;
+  }
+  .app-shell:is(:hover, :focus-within) :is(.shell-brand-type, .shell-nav a span, .shell-group-label, .shell-theme span, .shell-who, .shell-pin-label),
+  .sidebar-pinned .app-shell :is(.shell-brand-type, .shell-nav a span, .shell-group-label, .shell-theme span, .shell-who, .shell-pin-label) {
+    opacity: 1; visibility: visible;
+    transition: opacity 220ms ease 60ms, visibility 0s;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  body.has-shell .app-shell, .app-shell :is(.shell-brand-type, .shell-nav a span, .shell-group-label, .shell-theme span, .shell-who, .shell-pin-label) { transition: none !important; }
+}
+
+@media (max-width: 699px), (pointer: coarse) and (max-height: 500px) {
+  body.has-shell .app-main { grid-column: 1; }
+  body.has-shell, body.has-shell.sidebar-pinned { grid-template-columns: minmax(0, 1fr); padding-bottom: calc(var(--bar-h) + env(safe-area-inset-bottom)); }
+  .app-shell { display: none; }
+  .shell-bar { display: grid; grid-template-columns: repeat(5, 1fr); position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+    height: calc(var(--bar-h) + env(safe-area-inset-bottom)); padding: var(--s2) 0 env(safe-area-inset-bottom);
+    background: var(--surface-1); border-top: 1px solid var(--border); }
+  .shell-bar a, .shell-bar button { min-height: 44px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+    border: 0; background: none; color: var(--text-faint); font: 500 var(--fs-meta) var(--font); text-decoration: none; cursor: pointer; }
+  .shell-bar [aria-current="page"], .shell-bar .on { color: var(--accent-strong); }
+  .shell-bar .icon { width: 22px; height: 22px; }
+  .shell-sheet { position: fixed; left: var(--s3); right: var(--s3); bottom: calc(var(--bar-h) + var(--s2) + env(safe-area-inset-bottom)); z-index: 51;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-lg); padding: var(--s2); box-shadow: var(--shadow); }
+  .shell-sheet:not([hidden]) { display: grid; }
+  .shell-sheet a, .shell-sheet button { min-height: 44px; display: flex; align-items: center; gap: var(--s3); padding: var(--s3); border: 0; background: none;
+    color: var(--text); font: 500 var(--fs-body) var(--font); text-decoration: none; border-radius: var(--r-sm); cursor: pointer; text-align: left; }
+  .shell-sheet .icon { width: 20px; height: 20px; color: var(--text-muted); }
+}
+
+/* Before shell.js has run (theme-boot.js sets .shell-pending): hold the sidebar's space open and hide
+   what the shell replaces, so the first paint already has the final layout and nothing jumps. */
+html.shell-pending body { padding-left: var(--shell-w); }
+@media (min-width: 700px) { html.shell-pending body { padding-left: var(--rail-w); } }
+html.shell-pending body header .brand h1, html.shell-pending body header nav.tabs, html.shell-pending body header .account { display: none; }
+@media (max-width: 1199px) { html.shell-pending body { padding-left: var(--rail-w); } }
+@media (max-width: 699px), (pointer: coarse) and (max-height: 500px) { html.shell-pending body { padding-left: 0; padding-bottom: calc(var(--bar-h) + env(safe-area-inset-bottom)); } }
+
+/* the drawn ARGUS lettering, in place of the word set in the text font */
+.shell-wordmark { display: block; height: 19px; width: auto; }
+.shell-top .shell-wordmark { height: 15px; }
+.shell-brand-type strong, .shell-top strong { display: inline-flex; align-items: center; }
+
+/* ---- Ctrl+K search (command-palette.js) ---- */
+/* the sidebar's Search button is drawn as the pin button above it (.shell-pin), so it takes the rail's
+   collapsed and expanded layouts with no rules of its own */
+.shell-search { margin-bottom: var(--s2); }
+/* the phone's top bar: a 44px target that does not make the 45px bar taller (it overlaps the bar's
+   own 8px padding above and below) */
+.shell-top-search { flex-shrink: 0; display: grid; place-items: center; width: 44px; height: 44px; margin-block: -8px; margin-right: -10px;
+  padding: 0; border: 0; border-radius: var(--r-sm); background: none; color: var(--text-muted); cursor: pointer; }
+.shell-top-search .icon { width: 22px; height: 22px; }
+
+.cmdk { width: min(640px, calc(100vw - 24px)); max-height: min(560px, calc(100dvh - 48px)); margin: 10vh auto auto; padding: 0;
+  color: var(--text); background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow-pop); overflow: hidden; }
+.cmdk[open] { display: flex; flex-direction: column; }
+.cmdk::backdrop { background: var(--scrim); }
+.cmdk-box { display: flex; align-items: center; gap: var(--s2); padding: var(--s2) var(--s2) var(--s2) var(--s4); border-bottom: 1px solid var(--border); }
+.cmdk-box:focus-within { box-shadow: inset 0 -2px var(--accent); }
+.cmdk-box > .icon { width: 20px; height: 20px; flex: none; color: var(--text-muted); }
+/* the box itself is the field: the line under it shows the focus */
+.cmdk .cmdk-input, .cmdk .cmdk-input:focus-visible { flex: 1; min-width: 0; height: 44px; padding: 0; border: 0; background: none; outline: none; font-size: var(--fs-section); }
+.cmdk .cmdk-close { min-width: 44px; min-height: 44px; color: var(--text-muted); font-size: var(--fs-meta); background: none; }
+.cmdk-list { flex: 1; min-height: 0; overflow: auto; padding: var(--s2); }
+.cmdk-list:empty { display: none; }
+.cmdk-group-label { padding: var(--s2) var(--s3) var(--s1); color: var(--text-faint); font-size: var(--fs-meta); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+.cmdk-item { display: flex; align-items: center; gap: var(--s3); min-height: 44px; padding: 6px var(--s3); border-radius: var(--r-md); cursor: pointer; }
+.cmdk-item .icon { width: 20px; height: 20px; flex: none; color: var(--text-muted); }
+.cmdk-item:hover { background: var(--surface-hover); }
+.cmdk-item[aria-selected="true"] { background: var(--accent-soft); }
+.cmdk-item[aria-selected="true"] .icon { color: var(--accent-strong); }
+.cmdk-label { display: flex; flex-direction: column; min-width: 0; overflow: hidden; overflow-wrap: anywhere; }
+.cmdk-label small { color: var(--text-muted); font-size: var(--fs-meta); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cmdk-more { padding: var(--s1) var(--s3) var(--s2); color: var(--text-faint); font-size: var(--fs-meta); }
+.cmdk-note { margin: 0; padding: var(--s3) var(--s4); color: var(--text-muted); font-size: var(--fs-dense); }
+.cmdk-note:empty { display: none; }
+@media (max-width: 699px), (pointer: coarse) and (max-height: 500px) {
+  .cmdk { width: calc(100vw - 16px); max-height: calc(100dvh - 24px - env(safe-area-inset-top)); margin-top: calc(8px + env(safe-area-inset-top)); }
+}

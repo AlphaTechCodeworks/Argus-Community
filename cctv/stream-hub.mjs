@@ -1,0 +1,203 @@
+// Parent side of the live worker (CCTV_LIVE_WORKER=on): one HubStream per camera stream, fanned
+// out to every viewer. The worker sends each stream once; everything per viewer (GOP replay, slow
+// sockets) happens here, with the same rules as live.mjs LiveStream.
+import { CAP_BYTES, gateSend } from './backpressure.mjs'
+import { frameGaps } from './frame-gaps.mjs'
+import { replayGop } from './gop-replay.mjs'
+import { MSG, restart, streamKey, want, unwant } from './worker-ipc.mjs'
+
+const MAX_GOP_FRAMES = 400 // frames kept since the last keyframe, so new viewers start instantly
+// slow sockets: nothing is sent over the cap (1 MB sub, 4 MB main), see backpressure.mjs
+// keep a stream wanted a while after the last viewer leaves (grid <-> full screen switching)
+// A sub-stream (what every grid shows) is kept running for a while after its last viewer leaves, so
+// coming back to Live, paging, or closing a full-size view shows the picture at once instead of
+// waiting for the NVR to start the stream again (CCTV_SUB_LINGER_S, 180 by default). Sub-streams
+// are small; the main stream, the heavy one, still stops after 10 s.
+const SUB_LINGER_MS = (() => { const n = Number(process.env.CCTV_SUB_LINGER_S); return (Number.isFinite(n) && n >= 0 ? n : 180) * 1000 })()
+const STOP_DELAY_MS = { 0: 10_000, 1: SUB_LINGER_MS }
+
+// how evenly frames reach the main process from the NVRs' workers (frame-gaps.mjs); watches only
+const gaps = frameGaps('to viewers')
+
+export class HubStream {
+  constructor(hub, ch, type) {
+    this.hub = hub
+    this.ch = ch
+    this.type = type
+    this.streamType = type // (same field name as LiveStream)
+    this.key = streamKey(ch, type)
+    this.clients = new Set()
+    this.gop = []
+    this.stopTimer = null
+    this.wanted = false
+    this.fg = false // a real viewer (not only a warm-up) has asked for it: told to the worker
+    this.left = false // its linger ended and it took itself out of the hub (remove)
+  }
+
+  /**
+   * @param {{ replay?: boolean }} [o] replay false: nothing is replayed, and the socket starts where
+   *   its waitForKey says (a socket adaptive-live.mjs moves here at this stream's keyframe, from inside
+   *   its fan-out: it takes that keyframe as it goes out, once)
+   */
+  add(ws, { replay = true } = {}) {
+    // Its linger ended and it left the hub (remove), yet whoever kept hold of it adds to it again
+    // (adaptive-live.mjs keeps a socket's source for as long as the socket lives). Frames only reach
+    // the hub's stream of this camera, so it goes back in; or, where a newer one has taken its place
+    // meanwhile, the socket goes onto that one (remove finds it there).
+    if (this.left) {
+      const live = this.hub.streams.get(this.key)
+      if (live && live !== this) return live.add(ws, { replay })
+      this.hub.streams.set(this.key, this)
+      this.left = false
+    }
+    clearTimeout(this.stopTimer)
+    this.stopTimer = null
+    this.clients.add(ws)
+    const bg = ws.background === true
+    // a viewer's main stream is about to be asked for: on a P2P NVR, room for it first (freeIdleSubs)
+    if (this.type === 0 && !bg && !this.fg) this.hub.freeIdleSubs?.()
+    if (!this.wanted) {
+      this.wanted = true
+      this.fg = !bg
+      this.hub.send(want(this.ch, this.type, bg))
+    } else if (!bg && !this.fg) {
+      this.fg = true
+      this.hub.send(want(this.ch, this.type, false))
+    }
+    if (!replay) return
+    // replay the current GOP so the picture appears without waiting for the next keyframe
+    if (this.gop.length > 0) replayGop(this.gop, ws)
+    else ws.waitForKey = true
+  }
+
+  remove(ws) {
+    // (a socket that add handed on to the hub's newer stream of this camera)
+    if (this.left && !this.clients.has(ws)) return this.hub.streams.get(this.key)?.remove(ws)
+    this.clients.delete(ws)
+    // only warm-ups left: the worker may start it behind real viewers again. A sub-stream nobody
+    // watches any more (its linger) is background too: at an NVR's sub-stream limit a viewer's
+    // stream takes its place (nvr-worker.mjs); a viewer back within the linger makes it foreground
+    if (this.fg && (this.clients.size > 0 || this.type === 1) && ![...this.clients].some((c) => c.background !== true)) {
+      this.fg = false
+      this.hub.send(want(this.ch, this.type, true))
+    }
+    if (this.clients.size > 0 || this.closed) return
+    clearTimeout(this.stopTimer)
+    this.stopTimer = setTimeout(() => this.lingerOver(), this.hub.stopDelayMs[this.type] ?? 10_000)
+  }
+
+  /** Its linger is over, or cut short (StreamHub.freeIdleSubs): the worker is told to stop it. */
+  lingerOver() {
+    clearTimeout(this.stopTimer)
+    this.stopTimer = null
+    if (this.clients.size > 0) return
+    this.wanted = false
+    this.fg = false
+    this.gop = []
+    // with another stream of this camera in the hub by now it says nothing: its unwant would stop
+    // that one under everyone watching it
+    const live = this.hub.streams.get(this.key)
+    if (live && live !== this) return
+    this.hub.send(unwant(this.ch, this.type))
+    if (live === this) this.hub.streams.delete(this.key)
+    this.left = true
+  }
+
+  onFrame(buf, isKey) {
+    gaps?.note(`${this.hub?.nvrId}/${this.key}`)
+    if (isKey) this.gop = [buf]
+    else if (this.gop.length >= MAX_GOP_FRAMES) this.gop = [] // too long to replay intact
+    else if (this.gop.length > 0) this.gop.push(buf)
+    const cap = CAP_BYTES[this.type] ?? CAP_BYTES[0]
+    const now = Date.now()
+    for (const ws of this.clients) if (gateSend(ws, isKey, { cap, now })) ws.send(buf)
+  }
+
+  /** The worker restarted: old reference frames are useless to decoders. */
+  reset() {
+    this.gop = []
+    for (const ws of this.clients) ws.waitForKey = true
+  }
+
+  /** Viewers are dropped (their browsers reconnect); used when the NVR is removed. */
+  close() {
+    this.closed = true // the sockets' close handlers call remove(): no linger timer after this
+    clearTimeout(this.stopTimer)
+    this.stopTimer = null
+    for (const ws of [...this.clients]) ws.close?.(1011, 'NVR removed')
+    this.clients.clear()
+  }
+}
+
+export class StreamHub {
+  constructor(nvrId, send, { stopDelayMs = STOP_DELAY_MS, p2p = false } = {}) {
+    this.nvrId = nvrId
+    this.send = send
+    this.stopDelayMs = stopDelayMs
+    this.p2p = p2p // the NVR is reached by serial number, through the P2P cloud (freeIdleSubs)
+    this.streams = new Map()
+  }
+
+  getStream(ch, type) {
+    const key = streamKey(ch, type)
+    let s = this.streams.get(key)
+    if (!s) this.streams.set(key, (s = new HubStream(this, ch, type)))
+    return s
+  }
+
+  /**
+   * A viewer's main stream is about to be asked for on a P2P NVR, which serves only so many streams
+   * at once and refuses a main outright with a grid's worth of sub-streams open. The sub-streams
+   * nobody watches any more are only lingering for a quick return to the grid, yet they held the
+   * NVR's places for the whole linger: the full-size view took ~3 minutes to appear. Their lingers
+   * end now; they start again when the grid comes back. live.mjs #freeIdleSubs does this where the
+   * streams play, but in an NVR's worker it finds none to free: there each of them still has this
+   * process's tap on it until its unwant. One with a viewer or a warm-up on it here is left alone,
+   * and one the recorder writes plays on in the worker whatever is unwanted here.
+   * A sub whose every listener is a background one that can be told the stream ended (Argus Pro's detection
+   * tap) is freed too: live viewing wins, so each is closed (detection then lets
+   * the camera go and backs off) and the sub's stop goes to the worker at once. A warm-up has no
+   * close, keeps hold of its stream and would never warm it again: its sub is left as before.
+   */
+  freeIdleSubs() {
+    if (!this.p2p) return
+    for (const s of [...this.streams.values()]) {
+      if (s.type !== 1) continue
+      if (s.clients.size === 0) {
+        if (s.stopTimer) s.lingerOver()
+        continue
+      }
+      if (![...s.clients].every((c) => c.background === true && typeof c.close === 'function')) continue
+      for (const c of [...s.clients]) {
+        try {
+          c.close(1001, 'the recorder needs room for a viewer\'s main stream')
+        } catch {}
+        s.clients.delete(c) // (its close normally takes it off itself, through remove)
+      }
+      s.lingerOver()
+    }
+  }
+
+  onMessage(msg) {
+    if (msg?.t !== MSG.FRAME) return
+    this.streams.get(msg.key)?.onFrame(msg.buf, msg.isKey)
+  }
+
+  /** After a worker restart: reset every stream and ask again for the ones still watched. */
+  onWorkerRestart() {
+    for (const s of this.streams.values()) {
+      s.reset()
+      if (s.wanted) this.send(want(s.ch, s.type, !s.fg))
+    }
+  }
+
+  /** Asks the worker to restart one stream in place (viewers stay; they wait for the next keyframe). */
+  restartStream(ch, type, why) {
+    this.send(restart(ch, type, why))
+  }
+
+  closeAll() {
+    for (const s of this.streams.values()) s.close()
+    this.streams.clear()
+  }
+}

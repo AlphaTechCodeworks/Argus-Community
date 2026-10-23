@@ -1,0 +1,598 @@
+// Multi-camera playback without a screen: the camera list and its search, the fixed 2x2 / 3x3 grids
+// and which cameras are on the page now, the saved views a user keeps, which timeline lanes to draw,
+// what a view exports, and — the part that matters most on a real site — the rule that decides when a
+// tile is allowed to open a stream and when it must stop.
+//
+// No DOM and nothing imported from node, so the same rules run in the browser (public/wall.js) and on
+// the server (views.mjs), exactly as bookmarks-view.js is shared with bookmarks.mjs. A view the page
+// accepts and the server refuses, or the other way round, is a bug nobody can explain from either end.
+//
+// Times are absolute milliseconds, the same base as pb-view.js, pb-sources.js and wall-clock.js.
+// Tested offline: test/grid-view.test.mjs.
+//
+// ---- why the opening rules are here and not sprinkled through the page -------------------------
+//
+// An NVR shares one fixed bandwidth budget between recording to its own disk and serving streams to
+// us. On 2026-09-25 nvr-2 was at 128 Mb of its 192 Mb budget and simply refusing new streams, and
+// eleven of its cameras had recorded nothing at all as a result (see stream-choice.mjs). A 3x3 grid
+// of playback streams is nine more requests against that same budget, all at once, every time
+// somebody seeks. Opened carelessly this page could take a site off the air — not just make itself
+// slow. So the arithmetic that paces the opening, stops streams nobody is looking at, and backs off
+// after a refusal lives in one pure module where it can be read and tested, rather than in event
+// handlers where nobody would ever find it.
+import { checkCustomGrid } from './custom-layout.js'
+
+/** A camera key, "<nvr id>/<channel>" — the same rule as wall-clock.js and user-prefs.mjs. */
+export const KEY_RE = /^[A-Za-z0-9._-]{1,64}\/\d{1,4}$/
+
+/** The grids offered on the Wall. 'auto' is the old behaviour: as many columns as fit the space.
+ *  The rest are NxN; slotsOf/colsOf read the number off the name, so adding one needs no other change. */
+export const LAYOUTS = Object.freeze(['auto', '2x2', '3x3', '4x4', '5x5', '6x6', '8x8', '10x10', '12x12'])
+
+/** A view whose layout its owner drew (custom-layout.js): the drawing rides in the view's `custom`. */
+export const CUSTOM_LAYOUT = 'custom'
+
+/** The live grid's own layout ids (viewer.js): square grids and the "featured" big-tile arrangements.
+ *  A view saved on the live page carries one of these; checkView accepts them so the same saved-views
+ *  store serves both pages. The Wall falls back to a fitting grid for an id it does not draw. */
+export const LIVE_LAYOUTS = Object.freeze(['auto', 'g1', 'g2', 'g3', 'g4', 'g5', 'g6', 'g8', 'g10', 'g12', '1+5', '1+7', '1+12', '2+8', CUSTOM_LAYOUT])
+
+/** The most tiles one page of Live shows on a phone. Its list layout had 48 a page and its 3 x 3
+ *  nine: on a phone's screen that was a long column of "waiting" tiles, most of them out of sight. */
+export const PHONE_PAGE_MAX = 6
+
+/**
+ * A layout's cells as a phone's Live page draws them: the first PHONE_PAGE_MAX, the rest paged like any
+ * other camera past the end of a page. A smaller layout (one camera, 2 x 2) is the user's choice and
+ * kept as it is. The rows are those the kept cells reach (3 x 3 becomes two rows of three); a list
+ * keeps having no rows of its own, since it scrolls. Not a phone: the layout unchanged.
+ * @param {{ size: number, rows?: number, cells: number[][], list?: boolean }} layout
+ * @param {boolean} phone
+ */
+export function phonePage(layout, phone) {
+  if (!phone || layout.cells.length <= PHONE_PAGE_MAX) return layout
+  const cells = layout.cells.slice(0, PHONE_PAGE_MAX)
+  if (layout.list) return { ...layout, cells }
+  return { ...layout, rows: Math.max(...cells.map(([, row, , height]) => row + height - 1)), cells }
+}
+
+/** Auto uses only as many rows as the filtered cameras need; larger sets are paged. */
+export function autoLiveGrid(count, { noH265 = false, phone = false, width = 0, height = 0, gap = 8, pictureAspect = 16 / 9 } = {}) {
+  // Automatic layout must not create hundreds of hardware decoders on first load.
+  // Keep the previous nine-camera default as its budget; larger grids remain explicit.
+  const cap = phone ? 4 : 9
+  const visible = Math.min(cap, Math.max(1, Math.floor(Number(count) || 0)))
+  if (!(width > 0 && height > 0)) {
+    const size = Math.ceil(Math.sqrt(visible))
+    return { size, rows: Math.ceil(visible / size) }
+  }
+  let best = { size: 1, rows: visible, score: -1 }
+  const aspect = Number.isFinite(pictureAspect) && pictureAspect > 0 ? pictureAspect : 16 / 9
+  for (let size = 1; size <= Math.min(12, visible); size++) {
+    const rows = Math.ceil(visible / size)
+    if (size * rows > cap) continue
+    const score = Math.min((width - gap * (size - 1)) / size / aspect, (height - gap * (rows - 1)) / rows)
+    if (score > best.score) best = { size, rows, score }
+  }
+  return { size: best.size, rows: best.rows }
+}
+
+/**
+ * The size of the Live grid's cells, in px, so each cell has the picture's own shape. Cells that
+ * simply share out the grid's room (1fr) are rarely 16:9, and a picture shown whole (object-fit:
+ * contain) then left black strips above and below it inside every tile. Shaped like the picture,
+ * the tile is all picture, and the room left over sits round the grid, where the page shows. The
+ * biggest such cells that fit both ways. `border`: the tile's own border on each side, which is not
+ * picture. Null while the grid has no size yet (the caller keeps its 1fr tracks).
+ * @returns {{ col: number, row: number }|null}
+ */
+export function pictureTracks({ cols, rows, width, height, gap = 0, aspect = 16 / 9, border = 0 }) {
+  if (!(width > 0 && height > 0 && cols > 0 && rows > 0)) return null
+  const a = Number.isFinite(aspect) && aspect > 0 ? aspect : 16 / 9
+  const maxCol = (width - gap * (cols - 1)) / cols
+  const maxRow = (height - gap * (rows - 1)) / rows
+  if (!(maxCol > 2 * border && maxRow > 2 * border)) return null
+  const rowForCol = (maxCol - 2 * border) / a + 2 * border
+  // Whole px: the row is floored (a fraction over would overflow the box by that much) and the
+  // column taken from it, so the rounding leaves no px of black at the picture's sides
+  const row = Math.floor(Math.min(rowForCol, maxRow))
+  return { col: Math.min(Math.floor(maxCol), Math.round((row - 2 * border) * a + 2 * border)), row }
+}
+
+/**
+ * Whether the cameras on a grid (empty cells as null) come from more than one place: only then does a
+ * tile say where it is. A place is what the tile shows for it: its site, or its recorder's name on an
+ * install with no sites set.
+ */
+export function spansSites(cameras, placeOf = (c) => c.site || c.nvrName) {
+  let first
+  for (const c of cameras) {
+    if (!c) continue
+    const p = placeOf(c)
+    if (first === undefined) first = p
+    else if (p !== first) return true
+  }
+  return false
+}
+
+/** The most cameras one saved view may hold. Enough to fill the largest grid (12x12 = 144). */
+export const MAX_VIEW_CAMERAS = 144
+/** A view's name is a line in a menu, not a paragraph. */
+export const MAX_VIEW_NAME = 60
+/** Enough views for a working site; a guard against a runaway client filling the preferences file. */
+export const MAX_VIEWS = 50
+
+// A PC whose browser cannot play H.265 has its H.265 cameras converted to H.264 on the server
+// (h264-fallback.mjs), and each one costs the server CPU for as long as it is on screen. So the Live
+// page offers such a PC no grid of more than 16 tiles, and shows a larger one it is asked for (the
+// layout it last used, a saved view's) as 4 x 4. What is saved is not changed: the same view on a PC
+// that plays H.265 opens as it was saved. viewer.js hands in each layout's tile count (it draws
+// them), so nothing here names a layout but the one fallen back to.
+export const NO_H265_MAX_TILES = 16
+export const NO_H265_LAYOUT = 'g4'
+export const NO_H265_NOTE = 'This PC’s browser cannot play H.265, so the server converts those cameras for it; the grid is limited to 4 × 4.'
+
+/**
+ * The layouts a page may offer, in the order given.
+ * @param {Record<string, number>} tiles layout id -> how many tiles it shows at once
+ * @param {{ noH265?: boolean }} [o] noH265: the page knows its browser cannot play H.265
+ * @returns {string[]}
+ */
+export function layoutsOffered(tiles, { noH265 = false } = {}) {
+  return Object.keys(tiles ?? {}).filter((id) => !noH265 || tiles[id] <= NO_H265_MAX_TILES)
+}
+
+/**
+ * The layout to draw when `wanted` is asked for: itself, or 4 x 4 for one too large for a PC without
+ * H.265. An id the page does not draw is left alone (the caller has its own fallback for those).
+ * @returns {{ layout: string, limited: boolean }} limited: it was cut down, and the page says why
+ */
+export function layoutShown(wanted, tiles, { noH265 = false } = {}) {
+  const limited = noH265 && Number(tiles?.[wanted]) > NO_H265_MAX_TILES
+  return { layout: limited ? NO_H265_LAYOUT : wanted, limited }
+}
+
+/** export-job.mjs refuses more than this in one job, so the page must not offer more. */
+export const MAX_EXPORT_CLIPS = 32
+
+/**
+ * How long the page waits between opening one tile's stream and the next. Nine streams asked for in
+ * the same tick is exactly the burst an NVR at its ceiling refuses, and a refused stream is not a
+ * slow tile, it is a black one. Spacing them lets the earlier tiles' bitrate be measured by the NVR
+ * before the later ones are asked for, and lets a viewer who is only glancing at the grid move on
+ * before the whole of it has been opened at all.
+ */
+export const OPEN_STAGGER_MS = 700
+
+/** How many tiles may be waiting for their first picture at once. One at a time, deliberately. */
+export const MAX_OPENING = 1
+
+/** The first wait after a refusal, doubling each time. */
+export const BACKOFF_BASE_MS = 5000
+/**
+ * The longest wait after repeated refusals. Five minutes, matching the recorder's own backoff: an
+ * NVR that has said no four times running is full, and asking it again every few seconds is how the
+ * page turns one person's grid into everybody's missing footage.
+ */
+export const BACKOFF_MAX_MS = 5 * 60_000
+
+const num = (x, fallback = 0) => (Number.isFinite(x) ? Number(x) : fallback)
+const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim()
+
+// ---- the camera list -------------------------------------------------------------------------
+
+/**
+ * The cameras matching what someone typed. Every word must match somewhere in the camera's name, its
+ * NVR's name, its site or its channel number — so "yard 3" finds channel 3 in the yard, and the order
+ * of the words does not matter, because nobody remembers which way round a list was written.
+ *
+ * Channel numbers are matched as the viewer sees them (1-based, the way every page labels them) as
+ * well as the stored 0-based number, since a search for "1" that skipped the camera labelled 1 would
+ * simply look broken.
+ *
+ * @param {Array<{nvr?:string, ch?:number, name?:string, nvrName?:string, site?:string}>} cameras
+ * @param {string} query
+ */
+const searchText = new WeakMap()
+export function searchCameras(cameras, query) {
+  const words = oneLine(query).toLowerCase().split(' ').filter(Boolean)
+  if (words.length === 0) return (cameras ?? []).filter(Boolean)
+  return (cameras ?? []).filter((c) => {
+    if (!c) return false
+    const cached = searchText.get(c)
+    let hay = cached?.text
+    if (!cached || cached.name !== c.name || cached.nvrName !== c.nvrName || cached.site !== c.site || cached.nvr !== c.nvr || cached.ch !== c.ch) {
+      hay = [c.name, c.nvrName, c.site, c.nvr, String(num(c.ch, 0) + 1), String(num(c.ch, 0))]
+      .map((x) => String(x ?? '').toLowerCase())
+      .join(' ')
+      searchText.set(c, { name: c.name, nvrName: c.nvrName, site: c.site, nvr: c.nvr, ch: c.ch, text: hay })
+    }
+    return words.every((w) => hay.includes(w))
+  })
+}
+
+/** Cameras grouped for a picker: "<site> · <NVR>" in the order they first appear. */
+export function groupCameras(cameras) {
+  const out = new Map()
+  for (const c of (cameras ?? []).filter(Boolean)) {
+    const label = [c.site, c.nvrName ?? c.nvr].filter(Boolean).join(' · ') || 'Cameras'
+    if (!out.has(label)) out.set(label, [])
+    out.get(label).push(c)
+  }
+  return [...out].map(([label, list]) => ({ label, cameras: list }))
+}
+
+// ---- the grid --------------------------------------------------------------------------------
+
+/** How many tiles a layout shows at once; 0 for 'auto', which shows everything chosen. */
+export function slotsOf(layout) {
+  const m = /^(\d+)x(\d+)$/.exec(String(layout))
+  if (m) return Number(m[1]) * Number(m[2])
+  return 0
+}
+
+/** The column count for a layout, for the CSS variable the grid is drawn with. */
+export function colsOf(layout, count) {
+  const m = /^(\d+)x(\d+)$/.exec(String(layout))
+  if (m) return Number(m[1])
+  return Math.max(1, Math.ceil(Math.sqrt(Math.max(1, num(count, 1)))))
+}
+
+/**
+ * Which cameras are actually on screen, and how many pages the choice makes at this layout.
+ *
+ * Paging rather than shrinking is the whole bandwidth argument in one function: a 2x2 view of twelve
+ * cameras streams four, not twelve. The page number is clamped instead of wrapping, so removing a
+ * camera cannot leave somebody staring at an empty page they did not ask for.
+ *
+ * @returns {{ keys: string[], page: number, pages: number, slots: number }}
+ */
+export function pageOf(keys, layout, page = 0) {
+  const all = (keys ?? []).filter((k) => typeof k === 'string')
+  const slots = slotsOf(layout)
+  if (slots === 0) return { keys: all, page: 0, pages: 1, slots: all.length }
+  const pages = Math.max(1, Math.ceil(all.length / slots))
+  const p = Math.min(Math.max(0, Math.floor(num(page, 0))), pages - 1)
+  return { keys: all.slice(p * slots, p * slots + slots), page: p, pages, slots }
+}
+
+/** A sensible layout for a number of cameras, for a view saved before layouts existed. */
+export function layoutFor(count) {
+  const n = Math.max(0, Math.floor(num(count, 0)))
+  if (n <= 4) return '2x2'
+  if (n <= 9) return '3x3'
+  if (n <= 16) return '4x4'
+  if (n <= 25) return '5x5'
+  if (n <= 36) return '6x6'
+  if (n <= 64) return '8x8'
+  if (n <= 100) return '10x10'
+  return '12x12'
+}
+
+// ---- saved views -----------------------------------------------------------------------------
+
+/**
+ * A saved view, checked and tidied. Shared with the server so a name the page trims is the name the
+ * server stores. The id is made by the caller (the page) and kept as given when it is well formed,
+ * so a view edited on one screen stays the same view on another rather than becoming a second copy.
+ *
+ * @returns {{ ok: boolean, error: string|null,
+ *             value: { id: string, name: string, cameras: string[], layout: string,
+ *                      custom?: { size: number, big: number[][] }, shared?: true }|null }}
+ */
+export function checkView(raw, { known = null } = {}) {
+  const bad = (error) => ({ ok: false, error, value: null })
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return bad('A view must be an object')
+  const name = oneLine(raw.name)
+  if (!name) return bad('A view needs a name')
+  if (name.length > MAX_VIEW_NAME) return bad(`A view's name is at most ${MAX_VIEW_NAME} characters`)
+  if (!Array.isArray(raw.cameras)) return bad('A view needs a list of cameras')
+  const seen = new Set()
+  const cameras = []
+  for (const k of raw.cameras) {
+    if (typeof k !== 'string' || !KEY_RE.test(k)) return bad(`"${String(k).slice(0, 40)}" is not a camera key ("<nvr>/<channel>")`)
+    // A camera that no longer exists is dropped rather than refused: an NVR being removed must not
+    // make every view that mentioned it unsaveable.
+    if (known && !known.has(k)) continue
+    if (seen.has(k)) continue
+    seen.add(k)
+    cameras.push(k)
+  }
+  if (cameras.length === 0) return bad('A view needs at least one camera')
+  if (cameras.length > MAX_VIEW_CAMERAS) return bad(`A view holds at most ${MAX_VIEW_CAMERAS} cameras`)
+  const layout = LAYOUTS.includes(raw.layout) || LIVE_LAYOUTS.includes(raw.layout) ? raw.layout : layoutFor(cameras.length)
+  const id = typeof raw.id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(raw.id) ? raw.id : null
+  if (!id) return bad('A view needs an id')
+  const value = { id, name, cameras, layout }
+  // A drawn layout that is wrong is refused, not dropped: the view would otherwise open on a layout
+  // its owner never chose. Any other layout's leftover drawing is simply not kept.
+  if (layout === CUSTOM_LAYOUT) {
+    const drawn = checkCustomGrid(raw.custom)
+    if (!drawn.ok) return bad(drawn.error)
+    value.custom = drawn.value
+  }
+  // Shared with everyone (views.mjs sharedViews): kept only when it is exactly true, so a view saved
+  // before sharing existed, or by a page that does not know of it, stays its owner's alone.
+  if (raw.shared === true) value.shared = true
+  // The cameras to start first (startPlan). Absent on a view saved before it existed, and left off
+  // when empty, so such a view is stored exactly as before.
+  if (raw.startOrder !== undefined && raw.startOrder !== null) {
+    const order = checkStartOrder(raw.startOrder, { within: new Set(cameras) })
+    if (!order.ok) return bad(order.error)
+    if (order.value.length) value.startOrder = order.value
+  }
+  return { ok: true, error: null, value }
+}
+
+// ---- the start order ---------------------------------------------------------------------------
+//
+// Which cameras of a page are asked for first. The tiles stay where they are; only the order their
+// streams are requested in changes. The server queues its calls to each NVR, so the order the page
+// asks in is the order a recorder starts them: on a slow (P2P) recorder the camera somebody actually
+// watches the gate on can be first, not whichever one happens to sit top left.
+
+/** The most cameras a start order may name: as many as a view holds, and as a page can show. */
+export const MAX_START_ORDER = MAX_VIEW_CAMERAS
+/** The spacing between two tiles opened on the same NVR (the reason it is 15 ms is in viewer.js render). */
+export const START_STEP_MS = 15
+/**
+ * The head start the numbered cameras get: the others on the page begin this much later. The NVR's
+ * own queue already keeps them in order on each recorder, but the page's link (one shared socket
+ * through the tunnel) and the server's login lane are shared by every recorder; 100 ms lets the
+ * numbered streams be asked for and under way before the rest of the page competes with them, and is
+ * short enough that nobody waits for it on a fast recorder. A page with no numbered camera on it gets
+ * no lead at all, so it opens exactly as it did before the start order existed.
+ */
+export const START_LEAD_MS = 100
+
+/**
+ * A start order, checked: a list of camera keys, each once (a repeat is dropped), at most
+ * MAX_START_ORDER. `within` (a Set of keys): keys not in it are dropped rather than refused, as
+ * checkView drops a camera that no longer exists, so a camera taken out of a view does not make the
+ * view unsaveable.
+ * @returns {{ ok: boolean, error: string|null, value: string[]|null }}
+ */
+export function checkStartOrder(raw, { within = null } = {}) {
+  const bad = (error) => ({ ok: false, error, value: null })
+  if (!Array.isArray(raw)) return bad('A start order must be a list of camera keys')
+  if (raw.length > MAX_START_ORDER) return bad(`A start order names at most ${MAX_START_ORDER} cameras`)
+  const seen = new Set()
+  const value = []
+  for (const k of raw) {
+    if (typeof k !== 'string' || !KEY_RE.test(k)) return bad(`"${String(k).slice(0, 40)}" is not a camera key ("<nvr>/<channel>")`)
+    if (seen.has(k) || (within && !within.has(k))) continue
+    seen.add(k)
+    value.push(k)
+  }
+  return { ok: true, error: null, value }
+}
+
+/** A start order kept as a preference (JSON text), read leniently: [] for anything unusable. */
+export function parseStartOrder(text) {
+  try {
+    const { ok, value } = checkStartOrder(JSON.parse(String(text ?? '')))
+    return ok ? value : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Each tile's number in the start order: 1 for the first named camera on this page, 2 for the next…
+ * and 0 for a tile not named (or empty). Counted over the page only, so a camera named on another
+ * page takes no number here.
+ * @param {Array<string|null>} keys the page's tiles in reading order (null: no camera)
+ * @param {string[]} startOrder
+ * @returns {number[]}
+ */
+export function startRanks(keys, startOrder) {
+  const list = keys ?? []
+  const at = new Map()
+  list.forEach((k, i) => { if (typeof k === 'string' && !at.has(k)) at.set(k, i) })
+  const ranks = list.map(() => 0)
+  let n = 0
+  for (const k of Array.isArray(startOrder) ? startOrder : []) {
+    const i = at.get(k)
+    if (i === undefined || ranks[i]) continue
+    ranks[i] = ++n
+  }
+  return ranks
+}
+
+/**
+ * When each tile of a page opens: the numbered cameras first, in their order, then the rest in reading
+ * order. The stagger is still counted per NVR (viewer.js render explains why), but in that order, so
+ * on each recorder its first numbered camera is asked for first. The un-numbered tiles start
+ * START_LEAD_MS later, when the page has any numbered camera at all.
+ *
+ * @param {Array<{key:string, nvr:string}|null>} slots the page's tiles in reading order; null for a
+ *        tile that opens no stream (empty, or offline), which neither waits nor counts
+ * @param {string[]} startOrder
+ * @returns {{ order: number[], delays: number[] }} order: slot indices, first opened first;
+ *          delays: per slot index, ms before it asks for its stream (0 for a null slot)
+ */
+export function startPlan(slots, startOrder = [], { stepMs = START_STEP_MS, leadMs = START_LEAD_MS } = {}) {
+  const list = slots ?? []
+  const ranks = startRanks(list.map((s) => (s && typeof s.key === 'string' ? s.key : null)), startOrder)
+  const idx = list.map((_, i) => i).filter((i) => list[i])
+  const first = idx.filter((i) => ranks[i]).sort((a, b) => ranks[a] - ranks[b])
+  const rest = idx.filter((i) => !ranks[i])
+  const order = [...first, ...rest]
+  const lead = first.length ? Math.max(0, leadMs) : 0
+  const delays = list.map(() => 0)
+  const perNvr = new Map()
+  for (const i of order) {
+    const nvr = String(list[i].nvr ?? '')
+    const n = perNvr.get(nvr) ?? 0
+    perNvr.set(nvr, n + 1)
+    delays[i] = n * stepMs + (ranks[i] ? 0 : lead)
+  }
+  return { order, delays }
+}
+
+/** A view with its start order replaced ([] takes it off). */
+export function withStartOrder(view, order) {
+  const { startOrder: _old, ...rest } = view ?? {}
+  return Array.isArray(order) && order.length ? { ...rest, startOrder: [...order] } : rest
+}
+
+/**
+ * A whole list of views made safe: the bad ones dropped rather than the whole save refused, each id
+ * once (a later duplicate wins, which is what an edit looks like), at most MAX_VIEWS.
+ * @returns {{ views: Array, dropped: number }}
+ */
+export function normaliseViews(list, { known = null } = {}) {
+  const byId = new Map()
+  let dropped = 0
+  for (const raw of Array.isArray(list) ? list : []) {
+    const { ok, value } = checkView(raw, { known })
+    if (!ok) {
+      dropped++
+      continue
+    }
+    byId.set(value.id, value)
+  }
+  const views = [...byId.values()]
+  if (views.length > MAX_VIEWS) dropped += views.length - MAX_VIEWS
+  return { views: views.slice(0, MAX_VIEWS), dropped }
+}
+
+/**
+ * The stored shape of a user's views, versioned the way user-prefs.mjs versions the live grid's
+ * order: the version counts the saves, and a save made on an older version is refused rather than
+ * allowed to wipe one made on another screen.
+ * @returns {{ saved: boolean, views: Array, version: number }}
+ */
+export function applyViews(current, change, { known = null } = {}) {
+  const now = {
+    views: normaliseViews(current?.views, { known }).views,
+    version: Number.isSafeInteger(current?.version) && current.version >= 0 ? current.version : 0
+  }
+  if (!Number.isSafeInteger(change?.version) || change.version !== now.version) return { saved: false, ...now }
+  return { saved: true, views: normaliseViews(change.views, { known }).views, version: now.version + 1 }
+}
+
+// ---- the timeline lanes ----------------------------------------------------------------------
+
+/**
+ * Which cameras get a lane on the timeline. Two honest answers to two different questions:
+ *   'one' — "what has THIS camera got?", the single-camera playback page's lane, for the tile
+ *           somebody is working on;
+ *   'all' — "what has anything in this view got?", so a gap that is only on one camera stands out
+ *           against the rest, which is how you tell "nothing happened" from "that camera was down".
+ *
+ * 'all' is limited to the cameras actually on the page, not everything in the view: a lane for a
+ * camera on another page would be a promise the grid is not keeping.
+ *
+ * @param {'one'|'all'} mode
+ * @param {Array<{key:string}>} onScreen the tiles on this page, in order
+ * @param {string|null} focusKey the tile the toolbar is on, for 'one'
+ */
+export function laneSet(mode, onScreen, focusKey = null) {
+  const tiles = (onScreen ?? []).filter((t) => t && typeof t.key === 'string')
+  if (mode !== 'one') return tiles
+  const one = tiles.find((t) => t.key === focusKey) ?? tiles[0]
+  return one ? [one] : []
+}
+
+// ---- exporting a whole view ------------------------------------------------------------------
+
+/**
+ * The clips for POST /api/exports covering every camera in a view over one stretch — the same body
+ * shape the single-camera playback page sends, because there is one export path and this is it
+ * (export-api.mjs / export-job.mjs). The server refuses more than MAX_EXPORT_CLIPS, so a view larger
+ * than that is cut here and the caller says so, rather than the whole export failing at the end.
+ * @returns {{ clips: Array<{nvr:string, ch:number, fromMs:number, toMs:number}>, dropped: number, error: string|null }}
+ */
+export function exportClipsFor(keys, fromMs, toMs) {
+  const from = Math.round(num(fromMs, NaN))
+  const to = Math.round(num(toMs, NaN))
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+    return { clips: [], dropped: 0, error: 'Choose a stretch of time to export first.' }
+  }
+  const clips = []
+  for (const k of keys ?? []) {
+    if (typeof k !== 'string' || !KEY_RE.test(k)) continue
+    const cut = k.lastIndexOf('/')
+    clips.push({ nvr: k.slice(0, cut), ch: Number(k.slice(cut + 1)), fromMs: from, toMs: to })
+  }
+  if (clips.length === 0) return { clips: [], dropped: 0, error: 'There are no cameras in this view to export.' }
+  const dropped = Math.max(0, clips.length - MAX_EXPORT_CLIPS)
+  return { clips: clips.slice(0, MAX_EXPORT_CLIPS), dropped, error: null }
+}
+
+// ---- opening streams gently ------------------------------------------------------------------
+
+/**
+ * How long a tile waits before asking again after the NVR refused it. Doubling, capped, and never
+ * zero: the failure this guards against is a loop of requests against an NVR that is already full,
+ * which costs that NVR the bandwidth it needs to record and costs a site its footage.
+ */
+export function backoffMs(refusals, { base = BACKOFF_BASE_MS, max = BACKOFF_MAX_MS } = {}) {
+  const n = Math.max(0, Math.floor(num(refusals, 0)))
+  if (n === 0) return 0
+  return Math.min(max, base * 2 ** (n - 1))
+}
+
+/** A tile's stream state after the NVR refused it: one more refusal, and told when it may try again. */
+export function afterRefusal(s = {}, nowMs, opts) {
+  const refusals = Math.max(0, Math.floor(num(s.refusals, 0))) + 1
+  return { ...s, refusals, blockedUntil: num(nowMs, 0) + backoffMs(refusals, opts) }
+}
+
+/** A tile's stream state once pictures are arriving: refusals only mean anything in a row. */
+export function afterVideo(s = {}) {
+  return { ...s, refusals: 0, blockedUntil: 0 }
+}
+
+/** Whether a tile is allowed to ask for a stream at all yet. */
+export function mayOpen(s = {}, nowMs) {
+  return num(nowMs, 0) >= num(s.blockedUntil, 0)
+}
+
+/**
+ * What the grid should do this tick: which tiles to stop, and the one tile (at most) to open.
+ *
+ * Opening is deliberately one tile at a time and no faster than OPEN_STAGGER_MS, so a 3x3 grid comes
+ * up over about six seconds instead of firing nine simultaneous requests at NVRs that share one
+ * bandwidth budget with their own recording. Stopping comes first and is never rate limited: a tile
+ * that is off the page, behind a maximised tile or has nothing to show at this moment gives its
+ * bandwidth back immediately, because that is bandwidth the NVR can spend on recording.
+ *
+ * @param {Array<{key:string, wants:boolean, streaming:boolean, opening:boolean, blockedUntil?:number}>} tiles
+ *        `wants` is the page's answer to "should this tile be streaming at all" — on screen, not
+ *        hidden behind a maximised tile, and with footage at this moment.
+ * @param {number} nowMs
+ * @param {{ lastOpenAt?: number, staggerMs?: number, maxOpening?: number }} o
+ * @returns {{ close: string[], open: string|null, waiting: number }}
+ */
+export function openPlan(tiles, nowMs, { lastOpenAt = -Infinity, staggerMs = OPEN_STAGGER_MS, maxOpening = MAX_OPENING } = {}) {
+  const list = (tiles ?? []).filter((t) => t && typeof t.key === 'string')
+  const now = num(nowMs, 0)
+  const close = list.filter((t) => !t.wants && (t.streaming || t.opening)).map((t) => t.key)
+  const opening = list.filter((t) => t.wants && t.opening).length
+  const wanted = list.filter((t) => t.wants && !t.streaming && !t.opening)
+  const ready = wanted.filter((t) => mayOpen(t, now))
+  // The count reported is every tile still to come, including ones serving out a backoff, because
+  // "3 cameras waiting" is what the viewer needs to know; which of them is merely next is not.
+  const waiting = wanted.length
+  if (opening >= Math.max(1, maxOpening)) return { close, open: null, waiting }
+  if (now - num(lastOpenAt, -Infinity) < Math.max(0, staggerMs)) return { close, open: null, waiting }
+  return { close, open: ready[0]?.key ?? null, waiting }
+}
+
+/**
+ * What to say about a grid that is still coming up, or that an NVR has refused. Said out loud
+ * because the alternative is a viewer watching black squares and concluding the cameras are broken —
+ * and then asking for more streams, which is the last thing a full NVR needs.
+ */
+export function openNote({ waiting = 0, refused = 0 } = {}) {
+  if (refused > 0) {
+    return {
+      level: 'over',
+      text: `${refused} ${refused === 1 ? 'camera was' : 'cameras were'} refused: the NVR has no bandwidth left for another playback. Waiting before asking again — show fewer cameras, or use HD (the server's own recordings), which asks the NVR for nothing.`
+    }
+  }
+  if (waiting > 0) return { level: 'heavy', text: `Opening the cameras one at a time so the NVRs are not flooded — ${waiting} to go.` }
+  return { level: 'ok', text: '' }
+}

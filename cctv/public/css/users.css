@@ -1,0 +1,29 @@
+/* Users & access: one card per person (audit.js draws them). On a wide screen the cards sit as a
+   compact list, one line each, the columns lined up; narrower, each card stacks its lines with the
+   "…" menu on the right; nothing is ever wider than the screen. Colours, sizes and corners all come
+   from tokens.css. */
+.user-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column;
+  border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-1); }
+.user-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "who menu" "role menu" "where menu";
+  align-items: center; gap: var(--s1) var(--s3); padding: var(--s3); border-top: 1px solid var(--border); min-width: 0; }
+.user-card:first-child { border-top: 0; }
+.user-who { grid-area: who; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--s2); min-width: 0; }
+.user-name { font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.user-full { color: var(--text-muted); font-size: var(--fs-dense); overflow-wrap: anywhere; }
+.user-role { grid-area: role; display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); min-width: 0; }
+.user-note { color: var(--text-muted); font-size: var(--fs-meta); }
+.user-where { grid-area: where; display: flex; flex-wrap: wrap; gap: 0 var(--s3); color: var(--text-faint); font-size: var(--fs-dense); min-width: 0; }
+.user-where.is-on { color: var(--text-muted); }
+.user-where > span { overflow-wrap: anywhere; }
+.user-card > .menu-wrap { grid-area: menu; align-self: center; }
+
+/* a wide screen: a compact list, one line per person, the columns lined up down the list. A long
+   name or several connections are cut with "…"; the whole line is in the tooltip. */
+@media (min-width: 900px) {
+  .user-card { grid-template-columns: minmax(10rem, 1.3fr) minmax(9rem, 1fr) minmax(12rem, 1.6fr) auto;
+    grid-template-areas: "who role where menu"; padding: var(--s2) var(--s3); }
+  .user-who, .user-where { flex-wrap: nowrap; overflow: hidden; white-space: nowrap; }
+  .user-name, .user-full, .user-where > span { overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
+  .user-name { flex: none; max-width: 100%; }
+  .user-where > span:not(:last-child)::after { content: ","; }
+}

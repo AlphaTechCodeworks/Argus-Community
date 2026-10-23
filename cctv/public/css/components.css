@@ -1,0 +1,227 @@
+/* The parts every page is built from, defined once. Page stylesheets may place them but not
+   restyle them -- that rule is what stops each page drifting into its own look again. */
+
+/* ---- buttons ---- */
+/* A plain <button> is the secondary button. The pages hold hundreds of buttons with no class, and
+   giving the bare element the same look as .btn is what turns them into one style at once. .btn adds
+   only the layout an <a> needs to look like a button. A floor (min-height), not a fixed height: a
+   label that wraps, or a button holding a second line, grows rather than spilling out of its box. */
+button, .btn { min-height: 32px; padding: 0 var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-2); color: var(--text); font: 500 var(--fs-dense)/1.4 var(--font); cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast); }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: var(--s2); text-decoration: none; white-space: nowrap; }
+/* inline-flex would otherwise beat the browser's own [hidden] rule and show a hidden button */
+.btn[hidden] { display: none; }
+/* :where() gives the bare hover no weight, so a button with a colour of its own keeps it */
+:where(button:not(:disabled):hover), .btn:not(:disabled):hover { background: var(--surface-hover); }
+button:disabled, .btn:disabled, .btn[aria-busy="true"] { opacity: 0.5; cursor: default; }
+/* The one main action of a panel. --accent-solid rather than --accent: white words read on it in
+   both themes. */
+.btn-primary { background: var(--accent-solid); border-color: var(--accent-solid); color: var(--on-accent); font-weight: 600; }
+.btn-primary:not(:disabled):hover { background: var(--accent); border-color: var(--accent); }
+/* a main action that cannot be used yet reads grey, not as a faded blue that still looks pressable */
+.btn-primary:disabled { background: var(--surface-2); border-color: var(--border); color: var(--text-muted); }
+.btn-danger { background: var(--bad-soft); border-color: transparent; color: var(--bad-text); }
+.btn-ghost { background: none; border-color: transparent; color: var(--text-muted); }
+.btn-ghost:not(:disabled):hover { color: var(--text); background: var(--surface-hover); }
+/* dense rows (the camera editor, tables): a smaller button that still lines up with its neighbours */
+.btn-sm { min-height: 28px; padding: 0 var(--s2); }
+.btn-icon { width: 32px; padding: 0; }
+.btn svg, .btn-icon svg { width: 18px; height: 18px; }
+
+/* ---- segmented control and pills ---- */
+/* their buttons size themselves from their padding, inside the control's own box */
+.seg { display: inline-flex; padding: 2px; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-sm); }
+.seg button { min-height: 0; border: 0; background: none; color: var(--text-muted); font: 500 var(--fs-meta)/1 var(--font); padding: 6px 10px; border-radius: var(--r-sm); cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--surface-3); color: var(--text); }
+.pills { display: flex; flex-wrap: wrap; gap: var(--s1); }
+.pills button { min-height: 0; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-muted); font: 500 var(--fs-dense)/1 var(--font);
+  padding: 7px 14px; border-radius: 999px; cursor: pointer; }
+.pills button[aria-pressed="true"] { background: var(--text); color: var(--bg); border-color: var(--text); }
+
+/* ---- panels and cards ---- */
+.panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s5); box-shadow: var(--shadow); }
+.panel-head { display: flex; align-items: center; gap: var(--s3); margin: 0 0 var(--s4); }
+.panel-head h2 { font-size: var(--fs-section); font-weight: 600; margin: 0; }
+.panel-head > :last-child { margin-left: auto; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s4); }
+.card-label { color: var(--text-muted); font-size: var(--fs-meta); }
+.card-figure { font-size: var(--fs-figure); font-weight: 600; margin: 2px 0; }
+.card-meta { color: var(--text-faint); font-size: var(--fs-meta); }
+
+/* ---- forms ---- */
+.field { display: flex; flex-direction: column; gap: var(--s1); font-size: var(--fs-dense); color: var(--text-muted); min-width: 0; }
+.field-row { display: flex; flex-wrap: wrap; gap: var(--s3) var(--s4); align-items: flex-end; }
+.field-help { color: var(--text-faint); font-size: var(--fs-meta); }
+/* One field style, on the bare elements for the same reason as the bare button. It has the same
+   height as a button, so a field and its button sit level on one row. The type exclusions sit in
+   :where() so the rule weighs no more than a bare element: a field's own class (.pb-clock-input,
+   .rl-url, .osd-name …) still wins. The edge is --field-border, stronger than --border, so the box
+   that says "type here" is visible against the panel (WCAG 1.4.11). */
+input:where(:not([type="checkbox"], [type="radio"], [type="range"])), select, textarea, .input {
+  height: 32px; padding: 0 var(--s3); background: var(--surface-2); color: var(--text); border: 1px solid var(--field-border);
+  border-radius: var(--r-sm); font: var(--fs-body) var(--font); }
+/* A tick box or radio button sits on the line, box first, its words beside it, wherever it is.
+   Page sheets lay field labels out as a column (words above the field: .se-grid label, .st-dialog
+   label, .al-filters label …), and those rules also caught <label><input type="checkbox"> words</label>,
+   putting the box above its words (Settings > Alerts, 2026-10-19). This one rule puts every such
+   label back on one line. Its weight is on purpose: the doubled [type] makes it (0,2,2), above the
+   heaviest of those column rules (.se-grid label:not(.st-check), 0,2,1), so no page has to repeat it.
+   The box keeps its own size, and lines up with the first line when the words wrap. */
+/* a label the page hides (hidden attribute) stays hidden: the row rule below outweighs pages' own [hidden] rules */
+label[hidden] { display: none !important; }
+label:has(> input:is([type="checkbox"][type], [type="radio"][type])) {
+  display: flex; flex-direction: row; align-items: flex-start; justify-content: flex-start; gap: var(--s2); text-align: left; }
+label:has(> input:is([type="checkbox"][type], [type="radio"][type])) > input:is([type="checkbox"], [type="radio"]) {
+  flex: none; width: auto; height: auto; margin: 3px 0 0; }
+/* ... except one that also holds a field ("Alert after [ 30 ] seconds"): there the
+   box, the words and the field share a centre line */
+label:has(> input:is([type="checkbox"][type], [type="radio"][type])):has(> :is(select, input:not([type="checkbox"], [type="radio"]))) { align-items: center; }
+label:has(> input:is([type="checkbox"][type], [type="radio"][type])):has(> :is(select, input:not([type="checkbox"], [type="radio"]))) > input:is([type="checkbox"], [type="radio"]) { margin-top: 0; }
+/* boxes that hold more than one line grow with their rows */
+textarea { height: auto; padding: var(--s2) var(--s3); line-height: 1.4; }
+select[multiple], select[size]:not([size="1"]) { height: auto; padding: var(--s1); }
+/* the browser draws a colour or file picker's insides: only the box around it is ours */
+input[type="color"] { padding: 2px; }
+input[type="file"] { height: auto; padding: var(--s1); }
+.field input:where(:not([type="checkbox"], [type="radio"])), .field select, .field textarea { max-width: 22rem; }
+
+/* ---- tabs ---- */
+/* One row of text tabs with the chosen one underlined. Buttons with role="tab" (the camera editor)
+   and links with aria-current="page" (the hash-routed page tabs) are both tabs. The row scrolls
+   sideways on a narrow screen rather than wrapping, with no scrollbar drawn under the words. */
+.tabs-ui { display: flex; gap: var(--s1); flex-shrink: 0; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
+.tabs-ui::-webkit-scrollbar { display: none; }
+.tabs-ui > a, .tabs-ui > [role="tab"] { flex: none; height: auto; padding: 10px var(--s3); border: 0; border-bottom: 2px solid transparent;
+  border-radius: 0; background: none; color: var(--text-muted); font: 500 var(--fs-body)/1.4 var(--font); text-decoration: none;
+  white-space: nowrap; cursor: pointer; }
+.tabs-ui > a:hover, .tabs-ui > [role="tab"]:hover { color: var(--text); background: none; }
+.tabs-ui > [role="tab"][aria-selected="true"], .tabs-ui > a[aria-current="page"] { color: var(--text); border-bottom-color: var(--accent); }
+/* inside the scrolling row an outside ring would be clipped: draw it inside the tab */
+.tabs-ui > :focus-visible { outline-offset: -2px; }
+.tabs-ui > [hidden] { display: none; }
+/* On a narrow screen the row fades out at its right edge, so tabs cut off there read as "more this
+   way" (a phone once could not find the Settings Server tab). The fade sits over an end padding of
+   the same width, so once scrolled to the end the last tab is clear of it. */
+@media (max-width: 699px) {
+  .tabs-ui { padding-inline-end: var(--s6); -webkit-mask-image: linear-gradient(to left, transparent, black var(--s6));
+    mask-image: linear-gradient(to left, transparent, black var(--s6)); }
+}
+
+/* ---- phones ---- */
+/* a finger, not a mouse pointer: under 600px wide every button, field, tab and pill is at least 44px
+   tall, the size a fingertip can hit without catching its neighbour. The small button too: a dense
+   row on a phone is still pressed with a finger. A page rule that sizes one of these smaller outweighs
+   this one, so it says its own phone size (test/ui-components.test.mjs finds any that do not). */
+@media (max-width: 599px) {
+  button, .btn { min-height: 44px; }
+  input:where(:not([type="checkbox"], [type="radio"], [type="range"])), select, .input { height: 44px; }
+  .btn-icon { width: 44px; }
+  .btn-sm { min-height: 44px; }
+  textarea, select[multiple], select[size]:not([size="1"]), input[type="file"] { height: auto; }
+  .seg button { min-height: 44px; }
+  .pills button { min-height: 44px; }
+  /* a tab can be a link, which a min-height alone would not stretch: a flex box, its words centred */
+  .tabs-ui > a, .tabs-ui > [role="tab"] { display: inline-flex; align-items: center; min-height: 44px; }
+}
+
+/* ---- video ---- */
+/* The live and playback picture, its tiles and the playback bar under it keep their exact look in
+   this stage: their buttons and fields size themselves as they did before the one style above.
+   :where() keeps these at the weight of a bare element, so the bars' own rules still win. */
+:where(.pb-bar, .tile, .wall-tile) button { min-height: 0; padding: 4px 10px; font: inherit; }
+:where(.pb-bar, .tile, .wall-tile) select { height: auto; padding: 4px 10px; font: inherit; }
+:where(.pb-bar, .tile, .wall-tile) input:where(:not([type="checkbox"], [type="radio"], [type="range"])) { height: auto; padding: 3px 8px; font: inherit; }
+:where(.pb-bar, .tile, .wall-tile) :where(button:not(:disabled):hover) { background: var(--surface-2); }
+
+/* a checkbox sits beside its words, on the same line */
+.field-check { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--fs-dense); color: var(--text-muted); cursor: pointer; }
+.seg .seg-label { padding: 6px 8px; font-size: var(--fs-meta); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+/* ---- tables ---- */
+/* scrolls inside its own box on a narrow screen instead of dragging the whole page sideways */
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r-md); }
+.table { width: 100%; border-collapse: collapse; font-size: var(--fs-dense); }
+.table th { background: var(--surface-2); color: var(--text-muted); font-weight: 500; text-align: left; padding: var(--s2) var(--s3); white-space: nowrap; }
+.table td { padding: var(--s2) var(--s3); border-top: 1px solid var(--border); }
+.table tr:hover td { background: var(--surface-hover); }
+.table .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- "…" menu (menu-button.js) ---- */
+/* A row's less-used actions behind one button. The list opens under the button, lined up with its
+   right edge so it never pushes past the right of a narrow screen. */
+.menu-wrap { position: relative; display: inline-flex; }
+.menu-button { font-size: var(--fs-section); letter-spacing: 1px; }
+.menu-list { position: absolute; top: calc(100% + var(--s1)); right: 0; z-index: 20; min-width: 12rem; display: flex; flex-direction: column;
+  padding: var(--s1); background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); box-shadow: var(--shadow-pop); }
+/* display: flex would otherwise beat the browser's own [hidden] rule and show a closed menu */
+.menu-list[hidden] { display: none; }
+.menu-list > button { justify-content: flex-start; text-align: left; white-space: nowrap; border-color: transparent; background: none; color: var(--text); }
+.menu-list > button:not(:disabled):hover, .menu-list > button:focus-visible { background: var(--surface-hover); }
+
+/* ---- status ---- */
+.badge { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-meta); font-weight: 500; border-radius: 999px; padding: 2px 9px; }
+.badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.badge-ok { color: var(--ok); background: var(--ok-soft); }
+.badge-warn { color: var(--warn); background: var(--warn-soft); }
+.badge-bad { color: var(--bad); background: var(--bad-soft); }
+.badge-neutral { color: var(--text-muted); background: var(--surface-2); }
+.statusbar { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.stat { display: inline-flex; align-items: center; gap: var(--s2); padding: 7px 12px; border-radius: var(--r-md);
+  background: var(--surface-1); border: 1px solid var(--border); font-size: var(--fs-dense); font-weight: 500; }
+.stat-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
+.stat-dot.ok { background: var(--ok); } .stat-dot.warn { background: var(--warn); } .stat-dot.bad { background: var(--bad); }
+
+/* ---- page header ---- */
+/* Every page opens the same way: <header class="page-head"> with the page's name (h1), one short line
+   under it (p.page-sub) and the page's own actions on the right (.page-actions). Inside a page's
+   padded <main> it takes no padding of its own; on Live, Playback and Map, where <main> is the
+   video or the map, it sits above the toolbar and takes the workspace's gutter (below).
+   style.css still styles the bare <header> (the old toolbar) as a panel: background, padding and
+   justify-content are set here so none of that reaches the page header. */
+.page-head { display: flex; align-items: center; justify-content: flex-start; flex-wrap: wrap; gap: var(--s2) var(--s4);
+  margin: 0; padding: 0; background: none; min-width: 0; }
+.page-head-text { flex: 1 1 auto; min-width: 0; }
+/* one line at any width: a long title ends in … rather than pushing the actions onto a second row */
+.page-head h1 { margin: 0; font-size: var(--fs-title); font-weight: 600; letter-spacing: -0.02em; line-height: 1.2;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.page-sub { margin: 2px 0 0; color: var(--text-muted); font-size: var(--fs-body); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.page-actions { margin-left: auto; display: flex; align-items: center; flex-wrap: wrap; gap: var(--s2); }
+/* the video and map pages: the header is a strip above the toolbar, and the sub line sits beside the
+   title, so the picture loses as little height as it can. There it is a <header> straight inside
+   .app-main, which is what the old toolbar rules aim at (style.css, live.css, review.css
+   ".app-main > header": a bordered 56px panel, hidden when it has no .controls), so this rule outweighs
+   them all (body.has-shell ... header.page-head) and undoes their look. */
+body.has-shell .app-main > header.page-head { display: flex; flex-shrink: 0; min-height: 0; margin: 0; border: 0; border-radius: 0; background: none;
+  gap: var(--s2) var(--s4); padding: var(--s3) var(--workspace-gutter, var(--s4)) var(--s2); }
+.app-main > .page-head .page-head-text { display: flex; align-items: baseline; gap: var(--s3); }
+.app-main > .page-head h1 { flex: none; }
+.app-main > .page-head .page-sub { margin: 0; min-width: 0; }
+/* a phone: the shell's top bar (style.css .shell-top, the same query) already names the page, so the
+   h1 is kept for screen readers only; the sub line may wrap (Live's counts hold a button), and the
+   actions go under it, from the left */
+@media (max-width: 699px), (pointer: coarse) and (max-height: 500px) {
+  .page-head h1 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .page-sub { white-space: normal; }
+  .page-actions { margin-left: 0; flex-basis: 100%; }
+  body.has-shell .app-main > header.page-head { padding: var(--s2) var(--workspace-gutter, var(--s3)); row-gap: var(--s1); }
+  /* above the video, the small size the old line had there: Live's counts on one line, the picture's height kept */
+  .app-main > .page-head .page-sub { font-size: var(--fs-meta); }
+}
+
+/* ---- empty state ---- */
+.empty { display: grid; place-items: center; gap: var(--s2); padding: var(--s6); color: var(--text-faint); text-align: center; }
+/* Steady picture: the switch at the top of the camera editor's Picture tab (steady-switch.js) */
+.steady-switch { padding: 0 0 12px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+.steady-row { display: flex; gap: 8px; align-items: center; font-weight: 600; color: var(--text); cursor: pointer; }
+.steady-help, .steady-note { margin: 4px 0 0; font-size: var(--fs-meta); color: var(--text-muted); }
+.steady-note.steady-error { color: var(--bad); }
+/* Find device (Sites page, find-device.js) */
+.fd-results .st-found-item { align-items: flex-start; }
+.fd-results .st-found-item > .btn, .fd-results .st-found-item > button { flex: none; text-decoration: none; }
+.fd-facts { color: var(--text); }
+.fd-note { color: var(--text-muted); font-size: var(--fs-meta); }
+.fd-off strong { color: var(--text-muted); }
+.st-nvr.fd-flash { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Discover devices: each site's heading in the list */
+.fd-results li.fd-site { list-style: none; margin: 14px 0 4px; font-weight: 600; color: var(--text); border-bottom: 1px solid var(--border); padding-bottom: 4px; }

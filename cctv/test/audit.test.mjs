@@ -1,0 +1,296 @@
+// Offline tests for the audit trail (audit.mjs) and the Audit page's render (public/audit.js).
+// Temp data folder only; nothing is sent anywhere, and no SDK is needed.
+//   node cctv/test/audit.test.mjs
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const DATA = mkdtempSync(join(tmpdir(), 'cctv-audit-test-'))
+process.env.DATA_DIR = DATA
+
+const A = await import('../audit.mjs')
+const { renderAudit, stamp, actionLabel } = await import('../public/audit.js')
+
+let failures = 0
+const check = (name, ok, extra = '') => {
+  if (!ok) failures++
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? `  (${extra})` : ''}`)
+}
+
+const dir = (n) => {
+  const d = join(DATA, n)
+  mkdirSync(d, { recursive: true })
+  return d
+}
+const lines = (d) => readFileSync(A.AUDIT_FILE(d), 'utf8').split('\n').filter((l) => l.trim())
+
+const T0 = Date.UTC(2026, 8, 25, 9, 0, 0)
+const DAY = 86_400_000
+
+// ---- one row -------------------------------------------------------------------------------
+{
+  const d = dir('basic')
+  check('audit() returns true when it wrote', A.audit(d, { at: T0, user: 'boss', action: 'login', ip: '10.0.0.5' }) === true)
+  const row = JSON.parse(lines(d)[0])
+  check('the row holds what was given', row.user === 'boss' && row.action === 'login' && row.ip === '10.0.0.5' && row.at === T0, JSON.stringify(row))
+  check('ok defaults to true', row.ok === true)
+  check('one line per event', lines(d).length === 1)
+  A.audit(d, { at: T0 + 1, user: 'boss', action: 'logout' })
+  check('a second event appends, it does not replace', lines(d).length === 2)
+
+  const mode = statSync(A.AUDIT_FILE(d)).mode & 0o777
+  check(
+    process.platform === 'win32' ? 'audit.jsonl mode: not checked on Windows' : 'audit.jsonl is mode 0600',
+    process.platform === 'win32' ? true : mode === 0o600,
+    mode.toString(8)
+  )
+  check('auditFileMode reports it, and null on Windows where a mode means nothing', A.auditFileMode(d) === (process.platform === 'win32' ? null : mode))
+  check('auditFileMode is null when there is no file', A.auditFileMode(dir('empty-dir')) === null)
+}
+
+// ---- hostile rows --------------------------------------------------------------------------
+{
+  const d = dir('hostile')
+  // The forgery that matters for a line-per-row file: a newline inside a field would otherwise
+  // let a caller write a second, invented audit entry.
+  A.audit(d, { at: T0, user: 'evil\n{"at":1,"user":"boss","action":"login"}', action: 'login-failed' })
+  check('a newline in a field cannot forge a second row', lines(d).length === 1, lines(d).join(' | '))
+  const row = JSON.parse(lines(d)[0])
+  check('...the newline became a space', !row.user.includes('\n') && row.user.includes('evil'))
+
+  A.audit(d, { at: T0, user: 'x', action: 'become-admin' })
+  const made = JSON.parse(lines(d)[1])
+  check('an action we do not know becomes "other"', made.action === 'other')
+  check('...and the original is kept as rawAction, not lost', made.rawAction === 'become-admin')
+
+  A.audit(d, { at: T0, user: 'x'.repeat(500), action: 'login', detail: 'y'.repeat(5000), target: 'z'.repeat(5000) })
+  const capped = JSON.parse(lines(d)[2])
+  check('a huge user name is capped', capped.user.length === 64)
+  check('a huge detail is capped', capped.detail.length === 500)
+  check('a huge target is capped', capped.target.length === 200)
+
+  A.audit(d, {})
+  const bare = JSON.parse(lines(d)[3])
+  check('a row with nothing in it still records something', bare.user === 'anonymous' && bare.action === 'other' && Number.isFinite(bare.at))
+  A.audit(d, { at: 'not a time', user: 'x', action: 'login' })
+  check('a nonsense timestamp becomes now, never NaN', Number.isFinite(JSON.parse(lines(d)[4]).at))
+  A.audit(d, { at: T0, user: 'x', action: 'login', ok: false })
+  check('ok:false is recorded', JSON.parse(lines(d)[5]).ok === false)
+  check('auditRow is pure and exported for testing', A.auditRow({ at: T0, user: 'a', action: 'login' }).action === 'login')
+}
+
+// ---- a failed write is visible but harmless -------------------------------------------------
+{
+  A.resetAuditHealth()
+  check('the trail starts healthy', A.auditHealth().failures === 0)
+  // A path that cannot be a folder because a FILE of that name is in the way. This is the closest
+  // stand-in for the real case (a full or read-only disk) that works the same on Windows and Linux.
+  const blocker = join(DATA, 'blocked')
+  writeFileSync(blocker, 'not a folder')
+  let threw = null
+  try {
+    A.audit(blocker, { at: T0, user: 'boss', action: 'login' })
+  } catch (e) {
+    threw = e
+  }
+  check('a failed audit write does NOT throw (the request survives)', threw === null, String(threw))
+  check('...it returns false', A.audit(blocker, { at: T0, user: 'boss', action: 'login' }) === false)
+  check('...and it is counted, not silent', A.auditHealth().failures >= 1, String(A.auditHealth().failures))
+  check('...with the reason kept', typeof A.auditHealth().lastError === 'string' && A.auditHealth().lastError.length > 0)
+  check('...and when it happened', Number.isFinite(A.auditHealth().lastErrorAt))
+  A.resetAuditHealth()
+  check('resetAuditHealth clears it (for the tests only)', A.auditHealth().failures === 0)
+}
+
+// ---- reading and filtering -------------------------------------------------------------------
+const d = dir('read')
+{
+  A.audit(d, { at: T0, user: 'boss', action: 'login', ip: '10.0.0.1' })
+  A.audit(d, { at: T0 + 1000, user: 'jo', action: 'login-failed', ip: '10.0.0.2' })
+  A.audit(d, { at: T0 + 2000, user: 'jo', action: 'playback-view', target: 'nvr1/3' })
+  A.audit(d, { at: T0 + DAY, user: 'BOSS-2', action: 'export', target: 'nvr1/3', detail: 'pack' })
+  A.audit(d, { at: T0 + 2 * DAY, user: 'boss', action: 'settings-change', target: 'recording' })
+
+  const all = A.readAudit(d)
+  check('every row is read back', all.total === 5 && all.rows.length === 5)
+  check('newest first', all.rows[0].action === 'settings-change' && all.rows[4].action === 'login')
+  check('nothing damaged', all.damaged === 0 && all.truncated === false)
+
+  check('filter by action', A.readAudit(d, { action: 'login-failed' }).rows.every((r) => r.action === 'login-failed'))
+  check('...and it finds exactly the one', A.readAudit(d, { action: 'login-failed' }).total === 1)
+  check('filter by user is a case-insensitive substring', A.readAudit(d, { user: 'boss' }).total === 3, String(A.readAudit(d, { user: 'boss' }).total))
+  check('filter by user finds nothing for a stranger', A.readAudit(d, { user: 'nobody' }).total === 0)
+  check('filter by date range', A.readAudit(d, { from: T0 + 500, to: T0 + 3000 }).total === 2)
+  check('filters combine (and)', A.readAudit(d, { user: 'jo', action: 'login-failed' }).total === 1)
+  check('a range with nothing in it is empty, not everything', A.readAudit(d, { from: T0 + 10 * DAY }).total === 0)
+  check('limit caps the rows but total still says how many matched', A.readAudit(d, { limit: 2 }).rows.length === 2 && A.readAudit(d, { limit: 2 }).total === 5)
+  check('...and says it truncated', A.readAudit(d, { limit: 2 }).truncated === true)
+  check('a missing file reads as empty, not a crash', A.readAudit(dir('nothing-here')).total === 0)
+}
+
+// ---- damaged lines ---------------------------------------------------------------------------
+{
+  const dd = dir('damaged')
+  A.audit(dd, { at: T0, user: 'boss', action: 'login' })
+  writeFileSync(A.AUDIT_FILE(dd), `${readFileSync(A.AUDIT_FILE(dd), 'utf8')}{"at":123,"user":"hal"\n\n{"user":"no time"}\nnot json at all\n`)
+  A.audit(dd, { at: T0 + 5, user: 'jo', action: 'logout' })
+  const r = A.readAudit(dd)
+  check('good rows around the damage still read', r.total === 2, JSON.stringify(r.rows))
+  check('the damage is counted, not hidden', r.damaged === 3, String(r.damaged))
+  check('a row with no usable time counts as damaged', A.readAudit(dd).damaged === 3)
+}
+
+// ---- retention ---------------------------------------------------------------------------------
+{
+  check('a year is the retention', A.RETENTION_DAYS === 365)
+  const dp = dir('prune')
+  A.audit(dp, { at: T0 - 400 * DAY, user: 'old', action: 'login' })
+  A.audit(dp, { at: T0 - 366 * DAY, user: 'older-than-a-year', action: 'login' })
+  A.audit(dp, { at: T0 - 300 * DAY, user: 'within-the-year', action: 'login' })
+  A.audit(dp, { at: T0, user: 'today', action: 'login' })
+  const cut = T0 - A.RETENTION_DAYS * DAY
+  const res = A.pruneAudit(dp, cut)
+  check('rows older than a year are removed', res.removed === 2 && res.kept === 2, JSON.stringify(res))
+  const after = A.readAudit(dp)
+  check('...the recent rows survive', after.rows.some((r) => r.user === 'today') && after.rows.some((r) => r.user === 'within-the-year'))
+  check('...the old ones are gone', !after.rows.some((r) => r.user === 'old'))
+  check('the prune itself is recorded, so the gap is explained', after.rows.some((r) => r.action === 'audit-prune'))
+  check('the file is still one JSON object per line', lines(dp).every((l) => JSON.parse(l).at !== undefined))
+  check('pruning nothing changes nothing', A.pruneAudit(dp, cut).removed === 0)
+  check('pruning a file that is not there is not a crash', A.pruneAudit(dir('never-written'), cut).removed === 0)
+}
+
+// ---- retention past 10,000 rows (2026-10-20, X3-database#0) ------------------------------------
+// The prune once read the trail through readAudit, which hands back at most the newest 10,000 rows,
+// and rewrote the file with those: a year of audit was cut to its newest 10,000 rows on every round.
+{
+  const cut = T0 - A.RETENTION_DAYS * DAY
+  // 12,000 rows written in one go (through auditRow, so each is a real row): one append each is slow
+  const rowsFrom = (start, n, user) => Array.from({ length: n }, (_, i) => `${JSON.stringify(A.auditRow({ at: start + i * 60_000, user, action: 'playback-view' }))}\n`).join('')
+
+  const big = dir('prune-big')
+  writeFileSync(A.AUDIT_FILE(big), rowsFrom(T0 - 30 * DAY, 12_000, 'recent'), { mode: 0o600 })
+  const r1 = A.pruneAudit(big, cut)
+  check('12,000 rows all inside the year: the prune removes none', r1.removed === 0, JSON.stringify(r1))
+  check('...and the file keeps all 12,000', lines(big).length === 12_000, String(lines(big).length))
+  check('...and says it kept them all', r1.kept === 12_000, JSON.stringify(r1))
+
+  const mixed = dir('prune-mixed')
+  writeFileSync(A.AUDIT_FILE(mixed), rowsFrom(T0 - 400 * DAY, 3, 'too-old') + rowsFrom(T0 - 30 * DAY, 12_000, 'recent'), { mode: 0o600 })
+  const r2 = A.pruneAudit(mixed, cut)
+  check('3 rows past the year + 12,000 inside it: exactly the 3 go', r2.removed === 3 && r2.kept === 12_000, JSON.stringify(r2))
+  const left = lines(mixed).map((l) => JSON.parse(l))
+  check('...the 12,000 are all still in the file, plus the prune row', left.filter((r) => r.user === 'recent').length === 12_000 && left.length === 12_001, String(left.length))
+  check('...none of the old ones is', !left.some((r) => r.user === 'too-old'))
+  const said = left.find((r) => r.action === 'audit-prune')
+  check('...and the prune row says what really went', /^removed 3 rows older than /.test(said?.detail ?? ''), said?.detail)
+  check(
+    process.platform === 'win32' ? 'the rewritten file mode: not checked on Windows' : 'the rewritten file is still mode 0600',
+    process.platform === 'win32' ? true : (statSync(A.AUDIT_FILE(mixed)).mode & 0o777) === 0o600
+  )
+
+  // A damaged line (half a line after a power cut, or a row with no usable time) is evidence too:
+  // the prune keeps it in the file rather than dropping it on the rewrite.
+  const hurt = dir('prune-damaged')
+  const half = '{"at":123,"user":"hal"'
+  const noTime = '{"user":"no time"}'
+  writeFileSync(A.AUDIT_FILE(hurt), `${rowsFrom(T0 - 400 * DAY, 2, 'too-old')}${half}\n${rowsFrom(T0 - 10 * DAY, 2, 'recent')}${noTime}\n${rowsFrom(T0 - 5 * DAY, 1, 'recent')}`, { mode: 0o600 })
+  const r3 = A.pruneAudit(hurt, cut)
+  const kept = lines(hurt)
+  check('a prune that removes rows keeps the damaged lines, as they were', kept.includes(half) && kept.includes(noTime), kept.join(' | '))
+  check('...the old rows went and the recent ones stayed', r3.removed === 2 && kept.filter((l) => l.includes('"recent"')).length === 3, JSON.stringify(r3))
+  check('...and the damaged lines are counted, not hidden', r3.damaged === 2, JSON.stringify(r3))
+  const pruneRow = kept.map((l) => { try { return JSON.parse(l) } catch { return null } }).find((r) => r?.action === 'audit-prune')
+  check('...and the prune row says they were kept', /2 damaged lines kept/.test(pruneRow?.detail ?? ''), pruneRow?.detail)
+
+  // Nothing to remove: no rewrite at all, damaged line or not (and so no prune row either).
+  const calm = dir('prune-nothing')
+  const text = `${rowsFrom(T0 - 30 * DAY, 3, 'recent')}${half}\n${rowsFrom(T0 - 20 * DAY, 2, 'recent')}`
+  writeFileSync(A.AUDIT_FILE(calm), text, { mode: 0o600 })
+  const past = new Date(T0 - 2 * DAY)
+  utimesSync(A.AUDIT_FILE(calm), past, past)
+  const before = statSync(A.AUDIT_FILE(calm)).mtimeMs
+  const r4 = A.pruneAudit(calm, cut)
+  check('first row inside the year: nothing removed', r4.removed === 0, JSON.stringify(r4))
+  check('...and the file is not rewritten (same bytes)', readFileSync(A.AUDIT_FILE(calm), 'utf8') === text)
+  check('...and not touched (same modified time)', statSync(A.AUDIT_FILE(calm)).mtimeMs === before, `${statSync(A.AUDIT_FILE(calm)).mtimeMs} vs ${before}`)
+}
+
+// ---- the route --------------------------------------------------------------------------------
+{
+  const P = (o = {}) => new URLSearchParams(o)
+  const ADMIN = { user: 'boss', admin: true }
+  const VIEWER = { user: 'jo', admin: false }
+  // handleAudit asks rights.can; here it is injected, which is also how a caller overrides it.
+  const can = (who, action) => action === 'admin' && who?.user === 'boss'
+
+  const [s1, b1] = A.handleAudit('GET', '/api/admin/audit', P(), ADMIN, d, { can })
+  check('GET as admin: 200 with the rows', s1 === 200 && b1.rows.length === 5)
+  check('...and the retention and the trail health', b1.retentionDays === 365 && b1.health.failures === 0)
+  check('...and the list of actions, for the filter menu', b1.actions.includes('playback-view'))
+
+  const [s2, b2] = A.handleAudit('GET', '/api/admin/audit', P(), VIEWER, d, { can })
+  check('GET as a viewer: 403', s2 === 403, JSON.stringify(b2))
+  const [s3] = A.handleAudit('GET', '/api/admin/audit', P(), null, d, { can })
+  check('GET with no session: 403', s3 === 403)
+  // The escalation attempt: the filters are in the query string, the authority is not.
+  const [s4] = A.handleAudit('GET', '/api/admin/audit', P({ admin: 'true', user: 'boss' }), VIEWER, d, { can })
+  check('a viewer cannot become an admin through the query string', s4 === 403)
+  const [s5] = A.handleAudit('GET', '/api/admin/audit', P(), { user: 'jo', admin: true }, d, { can })
+  check('the injected check decides, not who.admin', s5 === 403)
+
+  const [s6, b6] = A.handleAudit('GET', '/api/admin/audit', P({ action: 'login-failed' }), ADMIN, d, { can })
+  check('the action filter reaches readAudit', s6 === 200 && b6.total === 1)
+  const [s7, b7] = A.handleAudit('GET', '/api/admin/audit', P({ action: 'nonsense' }), ADMIN, d, { can })
+  check('an unknown action filter is refused, not silently ignored', s7 === 400 && /must be one of/.test(b7.error))
+  const [s8, b8] = A.handleAudit('GET', '/api/admin/audit', P({ from: 'abc', to: '-5' }), ADMIN, d, { can })
+  check('nonsense dates fall back to "everything", they do not crash', s8 === 200 && b8.total === 5)
+  const [s9] = A.handleAudit('POST', '/api/admin/audit', P(), ADMIN, d, { can })
+  check('the audit log cannot be written to over HTTP: 405', s9 === 405)
+  check('another path: not handled (null)', A.handleAudit('GET', '/api/admin/settings', P(), ADMIN, d, { can }) === null)
+  check('with no rights function injected, only a session admin gets in', A.handleAudit('GET', '/api/admin/audit', P(), { user: 'x', admin: false }, d, { can: undefined })[0] === 403)
+}
+
+// ---- the page's render --------------------------------------------------------------------
+{
+  const body = A.handleAudit('GET', '/api/admin/audit', new URLSearchParams(), { user: 'boss', admin: true }, d, { can: () => true })[1]
+  const r = renderAudit(body)
+  check('every row is shown', r.rows.length === 5)
+  check('the action is in English, not jargon', r.rows.some((x) => x.action === 'Sign-in refused'))
+  check('actionLabel falls back gracefully', actionLabel('who-knows') === 'who-knows')
+  check('a refused sign-in is marked bad', r.rows.find((x) => x.actionKey === 'login-failed').state === 'bad')
+  check('an export is marked warn: it is the row people look for', r.rows.find((x) => x.actionKey === 'export').state === 'warn')
+  check('the summary counts', /5 entries/.test(r.summary), r.summary)
+  check('the retention is said on the page', /365 days/.test(r.retentionNote))
+  check('no warnings when all is well', r.warnings.length === 0, JSON.stringify(r.warnings))
+  check('the filter menu is offered in English', r.actions.some((a) => a.value === 'export' && a.label === 'Export made'))
+  check('a timestamp renders', typeof stamp(T0) === 'string' && stamp(T0).length > 5)
+  check('a nonsense timestamp renders as a dash, not "Invalid Date"', stamp(Number.NaN) === '—')
+
+  const empty = renderAudit({ rows: [], total: 0 }, { user: 'nobody' })
+  check('nothing matching says the filters are why', /those filters/.test(empty.summary), empty.summary)
+  check('nothing at all says that instead', /Nothing has been recorded/.test(renderAudit({ rows: [], total: 0 }).summary))
+
+  const warned = renderAudit({ rows: [], total: 0, damaged: 2, health: { failures: 3, lastError: 'ENOSPC' }, mode: 0o644 })
+  check('failed writes are shouted about on the page', warned.warnings.some((w) => /could not be written/.test(w) && /ENOSPC/.test(w)))
+  check('damaged lines are mentioned', warned.warnings.some((w) => /damaged/.test(w)))
+  check('a too-open file mode is mentioned', warned.warnings.some((w) => /644/.test(w)))
+  check('mode 600 raises nothing', renderAudit({ rows: [], mode: 0o600 }).warnings.length === 0)
+  check('an unknown mode (Windows, or no file) raises nothing', renderAudit({ rows: [], mode: null }).warnings.length === 0)
+  check('renderAudit survives a junk body', renderAudit(null).rows.length === 0 && renderAudit(undefined).warnings.length === 0)
+  check('renderAudit survives an error body', renderAudit({ error: 'nope' }).rows.length === 0)
+}
+
+// ---- the device on a sensitive row (withDevice) ----
+{
+  check('withDevice: the device after the detail', A.withDevice('admin, password set', 'Windows PC · Chrome 141') === 'admin, password set; device: Windows PC · Chrome 141')
+  check('withDevice: no detail, the device alone', A.withDevice('', 'iPhone · Safari 18') === 'device: iPhone · Safari 18' && A.withDevice(undefined, 'Mac') === 'device: Mac')
+  check('withDevice: no device, the detail as it was', A.withDevice('x', '') === 'x' && A.withDevice(null, undefined) === '')
+  const long = A.withDevice('y'.repeat(600), 'Android phone (Pixel 8) · Chrome 141')
+  check('withDevice: a long detail is cut, the device kept, and the row fits', long.endsWith('; device: Android phone (Pixel 8) · Chrome 141') && long.length <= 500 && A.auditRow({ user: 'a', action: 'x', detail: long }).detail === long, String(long.length))
+  check('withDevice: no new line can be smuggled in by a User-Agent', !/\n/.test(A.withDevice('a', 'Mac\nforged')))
+}
+
+rmSync(DATA, { recursive: true, force: true })
+console.log(failures ? `\n${failures} failed` : '\nall passed')
+process.exit(failures ? 1 : 0)

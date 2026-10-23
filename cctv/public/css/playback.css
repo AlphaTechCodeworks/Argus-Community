@@ -1,0 +1,135 @@
+/* Playback (One camera): a big picture and one bar of controls under it.
+   Loaded after style.css and review.css, which still hold the bar's parts (the transport, the ruler,
+   the tracks, full screen's glass); this sheet lays the page out and owns what is new. The picture,
+   timeline and glass keep their own exact tokens (--r-xs, --fs-tiny, --ov-*, --tl-*). */
+
+/* The picture is 16:9 from the moment the page opens (it used to be a 100 px strip while it loaded):
+   as wide as the page, but never so tall that the control bar and the timeline drop below the bottom
+   of the screen. --pb-room is the height left for it, measured by playback.js (fitPicture) from the
+   rows really above and below it; until then a guess from the screen height stands in. Where the
+   height is what limits it, the picture narrows and sits in the middle. It never goes below 480 x 270
+   (a very short window scrolls instead), nor wider than the page. */
+.playback-page.has-shell .app-main { overflow-y: auto; }
+.playback-page .pb-main { flex: none; align-items: flex-start; }
+.playback-page .pb-video {
+  flex: 0 1 auto; min-width: 0; aspect-ratio: 16 / 9; height: auto; margin-inline: auto;
+  width: min(100%, max(480px, calc(var(--pb-room, calc(100dvh - 420px)) * 16 / 9)));
+}
+/* the panels beside the picture (motion search, bookmarks) scroll inside themselves */
+.playback-page .pb-search, .playback-page .pb-bookmarks { align-self: stretch; max-height: 75vh; }
+@media (max-width: 800px) {
+  .playback-page .pb-main { align-items: stretch; }
+  .playback-page .pb-search, .playback-page .pb-bookmarks { max-height: 50vh; }
+}
+/* full screen: the picture fills the screen, whatever its shape */
+.playback-page.is-fullscreen .pb-video { aspect-ratio: auto; height: 100%; width: 100%; margin: 0; flex: 1 1 auto; }
+.playback-page.is-fullscreen .pb-main { flex: 1; }
+
+/* until the first picture arrives: a faint camera mark in the middle of the black box */
+.pb-placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ov-text-quiet); pointer-events: none; }
+.pb-placeholder .icon { width: 48px; height: 48px; opacity: 0.5; }
+/* (while the spinner turns, it is the one thing in the middle) */
+.pb-video:has(.pb-spinner:not([hidden])) .pb-placeholder { display: none; }
+
+/* ---- the picker row: One camera | Many cameras, Browse, the camera ---- */
+.playback-page .app-main > header.pb-picker {
+  margin: 0 var(--workspace-gutter) var(--s3); padding: 0; min-height: 0;
+  border: 0; border-radius: 0; background: none; gap: var(--s3);
+}
+.playback-page.has-shell .app-main > header.pb-picker .controls { gap: var(--s3); flex-wrap: nowrap; }
+.pb-scope { display: contents; }
+/* Browse keeps its words ("Browse · Dock"); the camera box is the one that gives way */
+.playback-page .pb-picker .camera-browser-launch { flex: 0 0 auto; max-width: 240px; }
+.pb-find { position: relative; flex: 0 1 320px; min-width: 0; }
+.playback-page .pb-find input {
+  width: 100%; padding-right: calc(var(--s2) + 20px);
+  text-overflow: ellipsis; color: var(--text);
+}
+.pb-find-caret { position: absolute; right: var(--s2); top: 50%; width: 18px; height: 18px; transform: translateY(-50%); color: var(--text-muted); pointer-events: none; }
+.pb-find-list {
+  position: absolute; z-index: 30; top: calc(100% + var(--s1)); right: 0;
+  width: max(100%, 320px); max-width: calc(100vw - 2 * var(--s4)); max-height: min(60vh, 420px); overflow-y: auto;
+  margin: 0; padding: var(--s1); list-style: none;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); box-shadow: var(--shadow-pop);
+}
+.pb-find-group {
+  padding: var(--s2) var(--s2) var(--s1); color: var(--text-muted);
+  font-size: var(--fs-meta); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pb-find-option {
+  padding: var(--s2); border-radius: var(--r-sm); cursor: pointer; color: var(--text); font-size: var(--fs-body);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pb-find-option:hover { background: var(--surface-hover); }
+.pb-find-option[aria-selected="true"] { background: var(--accent-soft); color: var(--accent-strong); }
+.pb-find-option.is-current { font-weight: 600; }
+.pb-find-none { padding: var(--s3) var(--s2); color: var(--text-muted); font-size: var(--fs-dense); }
+
+/* ---- the bar: three groups (when, playing, tools) that share a line where there is room and wrap
+   as whole groups where there is not; nothing in a group wraps on its own ---- */
+.playback-page .pb-xrow { flex-wrap: wrap; gap: var(--s2) var(--s3); }
+.playback-page .pb-xwhen { flex: 0 1 auto; flex-wrap: wrap; gap: var(--s2); }
+.pb-day { display: inline-flex; align-items: center; gap: var(--s1); }
+.playback-page .pb-day input[type="date"] { width: auto; min-width: 0; }
+.playback-page .pb-xp .pb-transport { flex: 0 1 auto; }
+.playback-page .pb-tools { position: relative; flex: 0 0 auto; flex-wrap: nowrap; margin-left: auto; gap: var(--s1); }
+/* captioned buttons are as wide as their words: the old fixed 38 px let "Full screen" spill out */
+.playback-page .pb-capped { width: auto; height: auto; min-width: 56px; padding-inline: var(--s2); }
+.playback-page .pb-cap { white-space: nowrap; }
+/* no tool is squeezed narrower than its picture and words; where the row is too short, it wraps */
+.playback-page .pb-tools > * { flex-shrink: 0; }
+/* the bar's speaker: a crossed-out speaker while sound is off, the sounding one (lit, as any pressed
+   tool) while it is on */
+.pb-sound-quick .i-sound-on, .pb-sound-quick[aria-pressed="true"] .i-sound-off { display: none; }
+.pb-sound-quick[aria-pressed="true"] .i-sound-on { display: block; }
+
+/* ---- More: a menu beside its button, floating over the bottom of the picture ---- */
+.playback-page .pb-more {
+  position: absolute; z-index: 25; right: 0; bottom: calc(100% + var(--s2));
+  width: min(380px, calc(100vw - 2 * var(--s4))); max-height: min(70vh, 520px); overflow-y: auto;
+  padding: var(--s3); gap: var(--s3);
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-md); box-shadow: var(--shadow-pop);
+}
+.pb-more-tools { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1); padding-bottom: var(--s3); border-bottom: 1px solid var(--border); }
+.pb-more-tools .pb-sound-extras { display: inline-flex; align-items: center; gap: var(--s2); }
+.playback-page .pb-more .pb-shuttle { width: 100%; }
+/* full screen: the glass bar scrolls, which would cut off a floating menu, so More opens inside it */
+.playback-page.is-fullscreen .pb-more { position: static; width: auto; max-height: none; flex-basis: 100%; box-shadow: none; background: transparent; border-color: var(--ov-glass-line); }
+.playback-page.is-fullscreen .pb-tools { flex-wrap: wrap; justify-content: flex-end; }
+
+/* the tablet rule in style.css gave the tools a row of their own; here they share the time's row */
+@media (max-width: 1100px) and (min-width: 641px) {
+  .playback-page .pb-tools { flex-basis: auto; }
+}
+/* How the bar fits is decided by its own width (sidebar pinned or not, full screen or not):
+   wide, one line with the tools captioned; a little narrower, still one line with the tools as
+   icons (each keeps its tooltip and spoken name) and the playing buttons a little narrower; narrower
+   still, the playing controls go centred onto a line of their own under the day, time and tools (the
+   tools as icons where only that keeps them beside the time). Measured 2026-10-19 (inside the bar's
+   padding, with Draw box and the speaker on the bar): one line needs about 1285 px with captions and
+   1110 px without; the day, time and tools need about 815 px with captions and 670 px without. Where
+   a guess is off (a wider date box in another language) the tools wrap, nothing spills. */
+.playback-page .pb-bar { container: pb-bar / inline-size; }
+@container pb-bar (min-width: 1110px) and (max-width: 1289px), (min-width: 670px) and (max-width: 819px) {
+  .playback-page .pb-tools > .pb-capped .pb-cap { display: none; }
+  .playback-page .pb-tools > .pb-capped { min-width: 40px; min-height: 40px; }
+}
+@container pb-bar (min-width: 1110px) and (max-width: 1289px) {
+  .playback-page .pb-xp .pb-tbtn { width: 36px; }
+}
+@container pb-bar (max-width: 1109px) {
+  .playback-page .pb-xp .pb-transport { order: 3; flex-basis: 100%; justify-content: center; }
+}
+/* phones: each group on a line of its own, centred; the picker row stacks */
+@media (max-width: 640px) {
+  /* (style.css stacks the groups in a column here; a column must not wrap, or it grows sideways) */
+  .playback-page .pb-xrow { flex-wrap: nowrap; align-items: center; }
+  .playback-page .pb-xp .pb-transport { flex-basis: auto; max-width: 100%; }
+  .playback-page .pb-xwhen, .playback-page .pb-tools { margin-inline: auto; justify-content: center; max-width: 100%; }
+  .playback-page .pb-tools { flex-wrap: wrap; }
+  .playback-page .pb-more { right: 50%; transform: translateX(50%); }
+}
+@media (max-width: 699px), (pointer: coarse) and (max-height: 500px) {
+  .playback-page.has-shell .app-main > header.pb-picker .controls { flex-wrap: wrap; }
+  .pb-find { flex: 1 1 200px; }
+}

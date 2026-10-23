@@ -1,0 +1,63 @@
+## Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+## OS X
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+
+## Editors and IDE
+*.sublime*
+*.code-workspace
+
+## Node.js
+lib-cov
+*.seed
+*.log
+*.csv
+*.dat
+*.out
+*.pid
+*.gz
+*.swp
+pids
+logs
+results
+tmp
+node_modules
+npm-debug.log
+
+## Build
+build
+
+## Coverage reports
+coverage
+
+## API keys and secrets
+.env
+
+## Quokka configuration
+.quokka
+data/
+dist/
+
+## CCTV: anything holding NVR credentials, recordings or camera images
+data.bak-*/
+backups/
+snapshots/
+*.tgz
+
+# Argus licence signing — PRIVATE keys must never be committed (public keys live in cctv/licence-keys.mjs)
+*-private.pem
+*signing-key*.pem
+argus-signing-key.pem
+
+# Pro package lock: the generated encrypted bundle (built at deploy) and the master secret (owner-only)
+cctv/argus-pro.bundle
+*bundle-secret*

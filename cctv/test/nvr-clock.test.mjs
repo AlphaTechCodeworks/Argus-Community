@@ -1,0 +1,259 @@
+// Tests for nvr-clock.mjs: reading an NVR's clock settings, writing them back safely, working out
+// a timezone offset, and the server acting as the master clock.
+// Run: node cctv/test/nvr-clock.test.mjs
+import { QUERY_TIME, buildTimeCfg, checkWanted, clockOverview, driftOf, formatForNvr, parseNvrTime, readClock, readWithRetry, readingOf, syncOutcome, zoneOffsetMs } from '../clock-time.mjs'
+
+let failures = 0
+const check = (n, ok, e = '') => { if (!ok) failures++; console.log(`${ok ? 'PASS' : 'FAIL'}  ${n}${e ? `  (${e})` : ''}`) }
+
+// Real answers from the site, 2026-09-25.
+const NVR1 = `<?xml version="1.0" encoding="UTF-8"?><response cmdUrl="queryTimeCfg"><status>success</status><content><timezoneInfo><timeZone>AST4</timeZone><daylightSwitch>false</daylightSwitch></timezoneInfo><synchronizeInfo><type type="synchronizeType">NTP</type><ntpServer>time-b.nist.gov</ntpServer><currentTime><![CDATA[25/09/2026 03:14:55 PM]]></currentTime></synchronizeInfo><formatInfo><date type="dateFormat">day-month-year</date><time type="timeFormat">12</time></formatInfo></content></response>`
+const NVR2 = `<?xml version="1.0" encoding="UTF-8"?><response cmdUrl="queryTimeCfg"><status>success</status><content><timezoneInfo><timeZone>AST4</timeZone><daylightSwitch>true</daylightSwitch></timezoneInfo><synchronizeInfo><type type="synchronizeType">manually</type><ntpServer>time.windows.com</ntpServer><currentTime><![CDATA[25/09/2026 15:19:49]]></currentTime></synchronizeInfo><formatInfo><date type="dateFormat">day-month-year</date><time type="timeFormat">24</time></formatInfo></content></response>`
+const RIG = `<?xml version="1.0" encoding="UTF-8"?><response cmdUrl="queryTimeCfg"><status>success</status><content><timezoneInfo><timeZone>EST5EDT,M3.2.0,M11.1.0</timeZone><daylightSwitch>true</daylightSwitch></timezoneInfo><synchronizeInfo><type type="synchronizeType">manually</type><ntpServer>time.windows.com</ntpServer><currentTime><![CDATA[25/09/2026 03:19:00 PM]]></currentTime></synchronizeInfo><formatInfo><date type="dateFormat">day-month-year</date><time type="timeFormat">12</time></formatInfo></content></response>`
+const WAREHOUSE = `<?xml version="1.0" encoding="UTF-8"?><response cmdUrl="queryTimeCfg"><status>success</status><content><timezoneInfo><timeZone><![CDATA[AST4]]></timeZone><daylightSwitch>false</daylightSwitch></timezoneInfo><synchronizeInfo><type type="synchronizeType">manually</type><ntpServer><![CDATA[time.windows.com]]></ntpServer><currentTime><![CDATA[25/09/2026 03:42:41 PM]]></currentTime></synchronizeInfo><formatInfo><date type="dateFormat">day-month-year</date><time type="timeFormat">12</time></formatInfo></content></response>`
+
+// ---- reading -------------------------------------------------------------------------------------
+{
+  const c = readClock(NVR1)
+  check('reads the timezone', c.timeZone === 'AST4', c.timeZone)
+  check('reads daylight saving off', c.daylight === false)
+  check('reads that it uses NTP', c.sync === 'NTP', c.sync)
+  check('reads the NTP server', c.ntpServer === 'time-b.nist.gov', c.ntpServer)
+  check('reads the clock it shows', c.currentTime === '25/09/2026 03:14:55 PM', c.currentTime)
+  check('reads the date format', c.dateFormat === 'day-month-year', c.dateFormat)
+  check('reads the time format', c.timeFormat === '12', c.timeFormat)
+}
+{
+  const c = readClock(WAREHOUSE)
+  check('reads a CDATA timezone', c.timeZone === 'AST4', c.timeZone)
+  check('reads a CDATA NTP server', c.ntpServer === 'time.windows.com', c.ntpServer)
+}
+{
+  check('nvr-2 has daylight saving on, unlike its neighbours', readClock(NVR2).daylight === true)
+  check('yard is on a different timezone', readClock(RIG).timeZone === 'EST5EDT,M3.2.0,M11.1.0')
+  check('three of them are set to manual', [NVR2, RIG, WAREHOUSE].every((x) => readClock(x).sync === 'manually'))
+}
+
+// ---- the clock overview (GET /api/admin/nvr-clocks) ---------------------------------------------------
+//
+// It had a reader of its own whose pattern matched nothing, so every setting of every NVR was null.
+{
+  const rig = clockOverview(RIG)
+  check('the overview reads the timezone', rig.timeZone === 'EST5EDT,M3.2.0,M11.1.0', String(rig.timeZone))
+  check('the overview reads the daylight saving switch as the NVR wrote it', rig.daylightSwitch === 'true' && clockOverview(NVR1).daylightSwitch === 'false', String(rig.daylightSwitch))
+  check('the overview reads how the clock is set', rig.synchronizeType === 'manually' && clockOverview(NVR1).synchronizeType === 'NTP', String(rig.synchronizeType))
+  check('the overview reads the NTP server, CDATA or not', clockOverview(NVR1).ntpServer === 'time-b.nist.gov' && clockOverview(WAREHOUSE).ntpServer === 'time.windows.com' && clockOverview(WAREHOUSE).timeZone === 'AST4')
+  check('what the NVR does not state stays null', rig.ntpInterval === null && Object.values(clockOverview('<response><status>fail</status></response>')).every((v) => v === null))
+}
+
+// ---- timezone offsets ------------------------------------------------------------------------------
+{
+  check('AST4 is four hours behind UTC', zoneOffsetMs('AST4', false) === -4 * 3600_000, String(zoneOffsetMs('AST4', false)))
+  check('daylight saving does not move a zone with no summer name', zoneOffsetMs('AST4', true) === -4 * 3600_000)
+  // The daylight saving switch says the NVR observes it, not that it is in force: that comes from
+  // the zone's own dates, on the day in question. These used to pass the switch as "it is summer",
+  // which is how the sync came to add the hour all year.
+  const EST = 'EST5EDT,M3.2.0,M11.1.0'
+  const h = 3600_000
+  const at = (...a) => Date.UTC(...a)
+  check('EST5EDT in winter is five hours behind', zoneOffsetMs(EST, true, at(2026, 0, 15, 12)) === -5 * h, String(zoneOffsetMs(EST, true, at(2026, 0, 15, 12))))
+  check('EST5EDT in summer is four hours behind', zoneOffsetMs(EST, true, at(2026, 6, 15, 12)) === -4 * h, String(zoneOffsetMs(EST, true, at(2026, 6, 15, 12))))
+  check('EST5EDT with daylight saving switched off is five hours behind all year',
+    zoneOffsetMs(EST, false, at(2026, 0, 15, 12)) === -5 * h && zoneOffsetMs(EST, false, at(2026, 6, 15, 12)) === -5 * h)
+  check('which is why yard matches the others today but not in November',
+    zoneOffsetMs(EST, true, at(2026, 8, 25, 19)) === zoneOffsetMs('AST4', false, at(2026, 8, 25, 19)) &&
+    zoneOffsetMs(EST, true, at(2026, 10, 15, 12)) !== zoneOffsetMs('AST4', false, at(2026, 10, 15, 12)))
+  // 2026: the second Sunday of March is the 8th and the first Sunday of November is the 1st. The
+  // clocks go forward at 02:00 EST (07:00 UTC) and back at 02:00 EDT (06:00 UTC).
+  check('summer time starts at 02:00 on the second Sunday of March',
+    zoneOffsetMs(EST, true, at(2026, 2, 8, 6, 59, 59)) === -5 * h && zoneOffsetMs(EST, true, at(2026, 2, 8, 7)) === -4 * h)
+  check('and ends at 02:00 summer time on the first Sunday of November',
+    zoneOffsetMs(EST, true, at(2026, 10, 1, 5, 59, 59)) === -4 * h && zoneOffsetMs(EST, true, at(2026, 10, 1, 6)) === -5 * h)
+  check('the dates move with the year', zoneOffsetMs(EST, true, at(2027, 2, 14, 6, 59, 59)) === -5 * h && zoneOffsetMs(EST, true, at(2027, 2, 14, 7)) === -4 * h &&
+    zoneOffsetMs(EST, true, at(2027, 10, 7, 5, 59, 59)) === -4 * h && zoneOffsetMs(EST, true, at(2027, 10, 7, 6)) === -5 * h)
+  check('week 5 is the last one in the month, and a given hour is used',
+    zoneOffsetMs('GMT0BST,M3.5.0/1,M10.5.0', true, at(2026, 2, 29, 0, 59, 59)) === 0 && zoneOffsetMs('GMT0BST,M3.5.0/1,M10.5.0', true, at(2026, 2, 29, 1)) === h &&
+    zoneOffsetMs('GMT0BST,M3.5.0/1,M10.5.0', true, at(2026, 9, 25, 0, 59, 59)) === h && zoneOffsetMs('GMT0BST,M3.5.0/1,M10.5.0', true, at(2026, 9, 25, 1)) === 0)
+  check('a southern summer runs over the new year',
+    zoneOffsetMs('AEST-10AEDT,M10.1.0,M4.1.0/3', true, at(2026, 0, 15)) === 11 * h && zoneOffsetMs('AEST-10AEDT,M10.1.0,M4.1.0/3', true, at(2026, 6, 15)) === 10 * h &&
+    zoneOffsetMs('AEST-10AEDT,M10.1.0,M4.1.0/3', true, at(2026, 11, 15)) === 11 * h)
+  // CST4CDT is on a production NVR. Without dates there is no telling whether the hour applies, and
+  // the wrong answer sets a recorder an hour out, so it is null and the sync leaves that clock alone.
+  check('a summer zone with no dates gives null when daylight saving is on, not a guess',
+    zoneOffsetMs('CST4CDT', true, at(2026, 0, 15)) === null && zoneOffsetMs('CST4CDT', true, at(2026, 6, 15)) === null)
+  check('and its standard offset when daylight saving is off', zoneOffsetMs('CST4CDT', false, at(2026, 6, 15)) === -4 * h)
+  check('dates it cannot read give null too', zoneOffsetMs('EST5EDT,M3.2.0', true, at(2026, 6, 15)) === null && zoneOffsetMs('EST5EDT,M13.2.0,M11.1.0', true, at(2026, 6, 15)) === null && zoneOffsetMs('EST5EDT,J60,J300', true, at(2026, 6, 15)) === null)
+  check('a zone it cannot read gives null, not a guess', zoneOffsetMs('Europe/London', false) === null)
+  check('an empty zone gives null', zoneOffsetMs('', false) === null && zoneOffsetMs(null, false) === null)
+}
+
+// ---- writing a moment in the NVR's own format ------------------------------------------------------
+{
+  const d = new Date(Date.UTC(2026, 8, 25, 15, 4, 5))
+  check('day-month-year, 24 hour', formatForNvr(d, { dateFormat: 'day-month-year', timeFormat: '24' }) === '25/09/2026 15:04:05')
+  check('day-month-year, 12 hour', formatForNvr(d, { dateFormat: 'day-month-year', timeFormat: '12' }) === '25/09/2026 03:04:05 PM')
+  check('year-month-day', formatForNvr(d, { dateFormat: 'year-month-day', timeFormat: '24' }) === '2026-09-25 15:04:05')
+  check('month-day-year', formatForNvr(d, { dateFormat: 'month-day-year', timeFormat: '24' }) === '09/25/2026 15:04:05')
+  const noon = new Date(Date.UTC(2026, 8, 25, 12, 0, 0))
+  const midnight = new Date(Date.UTC(2026, 8, 25, 0, 30, 0))
+  check('noon is 12 PM, not 00 PM', formatForNvr(noon, { timeFormat: '12' }).includes('12:00:00 PM'), formatForNvr(noon, { timeFormat: '12' }))
+  check('after midnight is 12 AM, not 00 AM', formatForNvr(midnight, { timeFormat: '12' }).includes('12:30:00 AM'), formatForNvr(midnight, { timeFormat: '12' }))
+}
+
+// ---- reading the NVR's time back -------------------------------------------------------------------
+{
+  check('reads a 12-hour afternoon time', parseNvrTime('25/09/2026 03:14:55 PM', { dateFormat: 'day-month-year' }) === Date.UTC(2026, 8, 25, 15, 14, 55))
+  check('reads a 24-hour time', parseNvrTime('25/09/2026 15:19:49', { dateFormat: 'day-month-year' }) === Date.UTC(2026, 8, 25, 15, 19, 49))
+  check('reads a morning time', parseNvrTime('25/09/2026 09:05:00 AM', { dateFormat: 'day-month-year' }) === Date.UTC(2026, 8, 25, 9, 5, 0))
+  check('reads month-day-year the American way', parseNvrTime('09/25/2026 15:00:00', { dateFormat: 'month-day-year' }) === Date.UTC(2026, 8, 25, 15, 0, 0))
+  check('reads year-month-day', parseNvrTime('2026-09-25 15:00:00', { dateFormat: 'year-month-day' }) === Date.UTC(2026, 8, 25, 15, 0, 0))
+  check('nonsense gives null rather than a wrong moment', parseNvrTime('not a time') === null && parseNvrTime('') === null && parseNvrTime(null) === null)
+  // a round trip is the real test: what we write must read back as the same moment
+  const t = Date.UTC(2026, 8, 25, 15, 4, 5)
+  for (const dateFormat of ['day-month-year', 'month-day-year', 'year-month-day']) {
+    for (const timeFormat of ['12', '24']) {
+      const back = parseNvrTime(formatForNvr(new Date(t), { dateFormat, timeFormat }), { dateFormat })
+      check(`round trip: ${dateFormat} ${timeFormat} hour`, back === t, `${back} != ${t}`)
+    }
+  }
+}
+
+// ---- building the document -------------------------------------------------------------------------
+{
+  const now = readClock(RIG)
+  const doc = buildTimeCfg(now, { timeZone: 'AST4', daylight: false })
+  check('the new timezone is in the document', doc.includes('<timeZone><![CDATA[AST4]]></timeZone>'))
+  check('daylight saving is turned off', doc.includes('<daylightSwitch>false</daylightSwitch>'))
+  check('what was not asked for is carried through', doc.includes('manually') && doc.includes('time.windows.com'), doc)
+  check('the formats are left as the owner had them', doc.includes('day-month-year') && doc.includes('>12<'), doc)
+  check('no time is set unless one was asked for', !doc.includes('currentTime'))
+}
+{
+  const now = readClock(NVR2)
+  const t = Date.UTC(2026, 8, 25, 19, 15, 0)
+  const doc = buildTimeCfg(now, { timeMs: t, offsetMs: -4 * 3600_000 })
+  check('the server time is written in the NVR local time', doc.includes('<currentTime><![CDATA[25/09/2026 15:15:00]]></currentTime>'), doc.slice(doc.indexOf('currentTime') - 10, doc.indexOf('currentTime') + 60))
+}
+{
+  // setting a time while the NVR takes its own from NTP would be pointless and confusing
+  const doc = buildTimeCfg(readClock(NVR1), { timeMs: Date.now() })
+  check('no time is pushed to an NVR that uses NTP', !doc.includes('currentTime'))
+}
+
+// ---- what a sync pass may claim ----------------------------------------------------------------------
+//
+// The sync used to record a drift of 0 and log "put right" the moment the NVR answered "success",
+// while writing a time taken before a 6 to 37 s wait: the clock was that far slow, Health said it
+// was exact, and the next pass wrote it again. What it says now comes from a reading.
+{
+  const off = -4 * 3600_000
+  const t = Date.UTC(2026, 8, 25, 19, 19, 49) // 15:19:49 on site, which is what NVR2 shows
+  check('a clock reading the server time has no drift', driftOf(readClock(NVR2), t, off) === 0, String(driftOf(readClock(NVR2), t, off)))
+  check('a clock behind the server is slow by that much', driftOf(readClock(NVR2), t + 20_000, off) === -20_000)
+  check('a reading with no time in it is no drift figure, not 0', driftOf({ currentTime: null }, t, off) === null && driftOf(null, t, off) === null)
+
+  check('a write that reads back within the limit was put right', syncOutcome(-1000, 4000) === 'put right')
+  check('one that reads back outside it is not called put right', /still reads -20 s out/.test(syncOutcome(-20_000, 4000)), syncOutcome(-20_000, 4000))
+  check('nor is one that could not be read back', /could not be read back/.test(syncOutcome(null, 4000)), syncOutcome(null, 4000))
+
+  check('Health gets the reading when nothing was written', readingOf({ drift: 1500, changed: false }) === 1500)
+  check('and the read-back after a write, not the reading from before it', readingOf({ drift: -47_000, after: -1000, changed: true }) === -1000)
+  check('a write with no read-back gives Health no reading, not a 0', readingOf({ drift: -47_000, after: null, changed: true }) === null && readingOf({ drift: -47_000, changed: true }) === null)
+  check('an NVR that could not be checked gives none either', readingOf({ drift: null, changed: false }) === null)
+}
+
+// ---- the documents we send are well formed -----------------------------------------------------
+//
+// This is the test that was missing. The query that reads an NVR's clock was built by writing an
+// opening <request> tag on top of the one XML_HEADER already provides -- two opens, one close.
+// Nothing failed loudly: the NVR answered something unreadable, every clock came back with a null
+// timezone, and the hourly master-clock pass decided it could not place any of the NVRs and left
+// them all alone. It ran for weeks and corrected nothing, and the only visible symptom was nvr-2
+// sitting four minutes fast.
+{
+  const opens = (s) => (s.match(/<request\b/g) ?? []).length
+  const closes = (s) => (s.match(/<\/request>/g) ?? []).length
+  check('the clock query opens <request> exactly once', opens(QUERY_TIME) === 1, `${opens(QUERY_TIME)} opening tags: ${QUERY_TIME}`)
+  check('and closes it exactly once', closes(QUERY_TIME) === 1, QUERY_TIME)
+  check('the clock query carries the XML declaration first', QUERY_TIME.startsWith('<?xml'), QUERY_TIME.slice(0, 20))
+  // the same trap in the document that actually writes a clock would set the wrong time, silently
+  const doc = buildTimeCfg(readClock(NVR2), { timeMs: Date.UTC(2026, 8, 25, 19, 15, 0), offsetMs: -4 * 3600_000 })
+  check('the clock write opens <request> exactly once', opens(doc) === 1, `${opens(doc)} opening tags`)
+  check('and closes it exactly once', closes(doc) === 1)
+  // every element opened is closed: a tag count mismatch is what made this invisible
+  const tags = doc.match(/<\/?[A-Za-z][A-Za-z0-9]*/g) ?? []
+  const depth = tags.reduce((d, t) => d + (t.startsWith('</') ? -1 : 1), 0)
+  check('the clock write document is balanced', depth === 0, `depth ${depth}`)
+}
+
+// ---- asking again ----------------------------------------------------------------------------------
+//
+// The NVRs that fail a clock check are the busy ones, not the unreachable ones: yard timed
+// out twice on a link that pings in 10 ms with no packet loss, while a routine SDK call to it took
+// 37 seconds. Giving up on the first attempt means the recorders that most need watching are the
+// ones never checked.
+{
+  const noWait = { waitMs: 0, sleep: async () => {} }
+  {
+    let calls = 0
+    const r = await readWithRetry(async () => { calls++; return NVR2 }, noWait)
+    check('a good answer first time is not asked for twice', calls === 1 && r.tries === 1 && r.clock.timeZone === 'AST4')
+  }
+  {
+    let calls = 0
+    const r = await readWithRetry(async () => {
+      calls++
+      if (calls < 3) throw new Error('the NVR did not accept the request (network timeout)')
+      return WAREHOUSE
+    }, noWait)
+    check('a busy NVR is asked again until it answers', calls === 3 && r.tries === 3 && r.clock.timeZone === 'AST4')
+  }
+  {
+    let thrown = null
+    let calls = 0
+    try {
+      await readWithRetry(async () => { calls++; throw new Error('network timeout') }, noWait)
+    } catch (e) { thrown = e }
+    check('an NVR that never answers gives up, and says why', thrown !== null && /network timeout/.test(thrown.message), String(thrown))
+    check('and does not ask for ever', calls === 3, String(calls))
+  }
+  {
+    // The failure that started all this: a malformed request gets an answer with no clock in it.
+    // Treating that as a reading is exactly what let the sync silently do nothing for weeks.
+    let thrown = null
+    const empty = '<?xml version="1.0"?><response cmdUrl="queryTimeCfg"><status>fail</status><errorCode>536870923</errorCode></response>'
+    try { await readWithRetry(async () => empty, noWait) } catch (e) { thrown = e }
+    check('an answer with no clock in it is not mistaken for a reading', thrown !== null && /not with its clock settings/.test(thrown.message), String(thrown))
+  }
+  {
+    // It waits between attempts rather than hammering an NVR that is already struggling.
+    const waits = []
+    let calls = 0
+    await readWithRetry(async () => { calls++; if (calls < 3) throw new Error('busy'); return NVR1 },
+      { waitMs: 5000, sleep: async (ms) => { waits.push(ms) } })
+    check('it pauses between attempts, but not before the first', waits.length === 2 && waits.every((w) => w === 5000), JSON.stringify(waits))
+  }
+}
+
+// ---- refusing nonsense -----------------------------------------------------------------------------
+{
+  const bad = (w, why) => {
+    let threw = false
+    try { checkWanted(w) } catch { threw = true }
+    check(`refuses ${why}`, threw)
+  }
+  bad({}, 'a change that changes nothing')
+  bad({ timeZone: 'Europe/London' }, 'a timezone the NVR cannot take')
+  bad({ timeZone: 'AST4; reboot' }, 'anything smuggled into a timezone')
+  bad({ ntpServer: 'evil.example.com' }, 'an NTP server the NVR does not offer')
+  bad({ timeMs: Date.now() + 400 * 86_400_000 }, 'a time a year out')
+  bad({ timeMs: Number.NaN }, 'a time that is not a number')
+  bad({ timeMs: Date.now(), offsetMs: 20 * 3600_000 }, 'an impossible timezone offset')
+
+  const ok = checkWanted({ timeZone: 'EST5EDT,M3.2.0,M11.1.0', daylight: true, ntp: true, ntpServer: 'time-b.nist.gov' })
+  check('accepts a sensible change', ok.timeZone === 'EST5EDT,M3.2.0,M11.1.0' && ok.daylight === true && ok.ntp === true)
+  check('accepts the server pushing its time', checkWanted({ timeMs: Date.now(), offsetMs: -4 * 3600_000 }).timeMs > 0)
+}
+
+console.log(failures ? `\n${failures} FAILED` : '\nall passed')
+process.exit(failures ? 1 : 0)

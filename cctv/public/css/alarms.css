@@ -1,0 +1,76 @@
+.alarms-page .alarms { padding: var(--s4) var(--s5) var(--s5); max-width: none; }
+/* the page header is the first thing in <main>, which is not a flex column here: its own gap */
+.alarms-page .alarms > .page-head { margin-bottom: var(--s4); }
+.alarms-page button, .alarms-page select, .alarms-page input:not([type="checkbox"]):not([type="hidden"]), .alarms-page summary { min-height: 44px; font-size: var(--fs-body); }
+
+/* The filters: one row, label words beside their fields rather than above them, so the row is one
+   field high. It wraps on a narrow window instead of scrolling sideways. The sheet wrapper only
+   matters on a phone; elsewhere its fields sit in the row as if it were not there. */
+.alarms-page .al-filters { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); margin-bottom: 0; }
+.alarms-page .al-filter-sheet { display: contents; }
+.alarms-page .al-filters-toggle { display: none; }
+.alarms-page .al-filters label { flex-direction: row; align-items: center; gap: var(--s2); font-size: var(--fs-dense); color: var(--text-muted); text-align: left; }
+.alarms-page .al-filters select { max-width: 280px; }
+.alarms-page .al-filters .al-search { flex: 1 1 200px; min-width: 0; }
+.alarms-page .al-filters .al-search input { flex: 1; min-width: 0; }
+/* the chips: a tick box beside its words, the whole pill clickable, filled while ticked */
+.alarms-page .al-chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.alarms-page .al-filters .al-chip { display: inline-flex; flex-direction: row; align-items: center; gap: var(--s2); min-height: 44px; padding: 0 var(--s3); border: 1px solid var(--field-border); border-radius: 999px; background: var(--surface-2); color: var(--text); cursor: pointer; white-space: nowrap; }
+.alarms-page .al-filters .al-chip:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.alarms-page .al-chip input { margin: 0; }
+/* More filters sits at the end of the row; opened, it takes a line of its own below it */
+.alarms-page .al-more { flex-basis: auto; }
+.alarms-page .al-more[open] { flex-basis: 100%; }
+.alarms-page .al-more summary { display: flex; align-items: center; cursor: pointer; }
+.alarms-page .al-more-body { align-items: center; }
+
+/* the one urgency line ("2 high · 14 medium · 300 low") that replaced the four cards */
+.al-overview { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--s1); margin: var(--s3) 0 0; font-variant-numeric: tabular-nums; color: var(--text-muted); }
+/* each count is a quiet button that filters to its urgency; pressed, it is marked like a ticked chip */
+.alarms-page .al-overview .btn { padding: 0 var(--s2); color: var(--text); font-variant-numeric: tabular-nums; }
+.alarms-page .al-overview .btn[aria-pressed="true"] { background: var(--accent-soft); color: var(--text); }
+.al-overview:empty { display: none; }
+.alarms-page .al-summary { margin: var(--s2) 0; }
+.alarms-page .al-updated { margin: 0 0 var(--s4); }
+.al-updated { color: var(--text-muted); font-size: var(--fs-dense); }
+.al-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r-md); }
+.alarms-page .al-table { min-width: 900px; margin: 0; }
+.alarms-page .al-table th { padding: var(--s3); background: var(--surface-2); font-size: var(--fs-dense); }
+.alarms-page .al-table td { padding: var(--s3); font-size: var(--fs-body); }
+.alarms-page .al-table td:nth-child(3) { min-width: 160px; }
+.alarms-page .al-table tr.pri-critical td:first-child { box-shadow: inset 3px 0 var(--bad); }
+.alarms-page .al-table tr.pri-high td:first-child { box-shadow: inset 3px 0 var(--warn); }
+.alarms-page .al-actions { display: table-cell; min-width: 220px; }
+.al-action-group { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.al-evidence summary { display: flex; align-items: center; padding: var(--s2) var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); cursor: pointer; color: var(--text-muted); }
+.al-evidence summary::after { content: ' ▾'; margin-left: var(--s2); }
+.al-evidence-actions { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s2); }
+.alarms-page .al-actions button, .alarms-page .al-actions a { min-height: 40px; padding: var(--s2) var(--s3); display: inline-flex; align-items: center; font-size: var(--fs-dense); }
+.al-pagination { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); margin-top: var(--s4); }
+.al-pagination span { color: var(--text-muted); }
+.alarms-page .al-rules li, .alarms-page .al-rule-form, .alarms-page .al-tune { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-1); padding: var(--s4); }
+@media (max-width: 699px) {
+  .alarms-page .alarms { padding: var(--s3); }
+  /* the header's second line goes, so the list starts on the first screen */
+  .alarms-page .alarms > .page-head .page-sub { display: none; }
+  /* Browse and Filters share the one line; everything else waits in the sheet under them */
+  .alarms-page .al-filters { flex-wrap: nowrap; }
+  .alarms-page .al-filters .camera-browser-launch { flex: 1 1 auto; min-width: 0; max-width: 100%; }
+  .alarms-page .al-filters-toggle { display: inline-flex; flex: none; }
+  .alarms-page .al-filter-sheet { display: none; }
+  .alarms-page .al-filters.is-open .al-filter-sheet { position: absolute; top: calc(100% + var(--s2)); left: 0; right: 0; z-index: 30; display: flex; flex-direction: column; align-items: stretch; gap: var(--s3); max-height: calc(100dvh - 160px); overflow-y: auto; padding: var(--s4); background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow); }
+  .alarms-page .al-filter-sheet > label { justify-content: space-between; min-width: 0; }
+  .alarms-page .al-filter-sheet select { flex: 1; width: auto; min-width: 0; max-width: 70%; }
+  .alarms-page .al-filters .al-search { flex: none; }
+  .alarms-page .al-more-body { flex-direction: column; align-items: stretch; }
+  .alarms-page .al-more-body label { justify-content: space-between; }
+  .al-pagination { flex-wrap: wrap; }
+  .alarms-page .al-table { min-width: 0; }
+  .alarms-page .al-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .alarms-page .al-table tbody { display: block; }
+  .alarms-page .al-table tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); padding: var(--s2); border-bottom: 1px solid var(--border); }
+  .alarms-page .al-table td { display: block; min-width: 0; border: 0; overflow-wrap: anywhere; }
+  .alarms-page .al-table td::before { content: attr(data-label); display: block; font-size: var(--fs-meta); color: var(--text-muted); margin-bottom: var(--s1); }
+  .alarms-page .al-table td:nth-child(3), .alarms-page .al-table td:nth-child(4), .alarms-page .al-table .al-actions, .alarms-page .al-table td[colspan] { grid-column: 1 / -1; min-width: 0; }
+  .alarms-page .al-actions a, .alarms-page .al-actions button { min-height: 44px; }
+}

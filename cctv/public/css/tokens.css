@@ -1,0 +1,226 @@
+/* The palette, type, spacing and shape of the whole app. Every colour anywhere under css/ comes
+   from here, and test/css-tokens.test.mjs fails the moment one does not -- the old style.css had
+   drifted to 69 distinct colours, which is most of why no two pages looked like the same product.
+   Dark is the default; the light theme overrides surfaces and text only, so status colours mean
+   the same thing in both. Selectors use html:root so the old style.css, which reuses some names
+   on a plain :root, cannot override them. */
+html:root {
+  color-scheme: dark;
+  --bg: #0e1012;
+  --surface-1: #121417;
+  --surface-2: #181b1f;
+  --surface-3: #1d2530;
+  --surface-hover: #1c1f24;
+  --border: #22262b;
+  --text: #eceef1;
+  --text-muted: #9aa0a8;
+  --text-faint: #5d636b;
+  /* the edge of a text field, select or text box: strong enough (3:1) to show where to type */
+  --field-border: #5d636b;
+  --accent: #3b82f6;
+  --accent-solid: #1d4ed8;
+  --accent-strong: #5b9bff;
+  --accent-soft: rgba(59, 130, 246, 0.15);
+  --on-accent: #ffffff;
+  --ok: #22c55e;
+  --ok-text: #22c55e;
+  --bad-solid: #b91c1c;
+  --ok-soft: rgba(34, 197, 94, 0.15);
+  --warn: #f59e0b;
+  --warn-soft: rgba(245, 158, 11, 0.15);
+  --bad: #ef4444;
+  --bad-soft: rgba(239, 68, 68, 0.15);
+  /* video is black in both themes: only the card around a picture changes */
+  --video-bg: #000000;
+  --scrim: rgba(0, 0, 0, 0.55);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --focus: #5b9bff;
+  /* controls laid over the picture (the full-size view's strip, sound, alerts): over video, so the
+     same in both themes */
+  --ov-bg: rgba(20, 22, 26, .82);
+  --ov-bg-soft: rgba(20, 22, 26, .6);
+  --ov-bg-hover: rgba(40, 44, 52, .85);
+  --ov-text: #ffffff;
+  --ov-line: rgba(255, 255, 255, .18);
+  --ov-line-strong: rgba(255, 255, 255, .35);
+  --ov-edge: rgba(0, 0, 0, .5);
+  --ov-bad: rgba(200, 30, 30, .92);
+  --ov-bad-hover: rgb(220, 38, 38);
+  --ov-mark: #f5b942;
+  --ov-mark-line: rgba(245, 185, 66, .8);
+  --ov-on: #00aeef;
+  --ov-on-line: rgba(0, 174, 239, .9);
+  --ov-on-bg: rgba(0, 174, 239, .28);
+  /* Over the picture (tiles, the wall, the player, the map): the exact values
+     those surfaces have always had, the same in both themes (said again in the light block). */
+  --ov-shade: rgba(0, 0, 0, .75); /* the fade under a tile's name; the halo round map site labels */
+  --ov-live: rgba(21, 128, 61, .92); /* the green LIVE badge */
+  --ov-badge-bg: rgba(20, 22, 26, .55); /* a tile's state badge when it is neither live nor offline */
+  --ov-bg-faint: rgba(20, 22, 26, .45); /* the phone's full-screen button */
+  --ov-step-bg: rgba(20, 22, 26, .35); /* the step arrows on the full-size camera */
+  --ov-step-text: rgba(255, 255, 255, .85); /* their arrows */
+  --ov-note-bg: rgba(0, 0, 0, .72); /* a notice on the picture; the phone list's name fade */
+  --ov-note-glass: rgba(20, 22, 26, .75); /* the phone full-screen note */
+  --ov-stats-bg: rgba(0, 0, 0, .7); /* the D-key stats box */
+  --ov-stats: #b9f5c9; /* the D-key stats text */
+  --ov-ring: rgba(255, 255, 255, .2); /* the loading spinner's ring; the full-screen button's edge */
+  --ov-label: #eceef1; /* names and notes over the picture */
+  --ov-label-quiet: #c4c8ce; /* a quieter word beside a name over the picture (a tile's site): still over 4.5:1 on --ov-shade over white */
+  --ov-badge-text: #e6e8eb; /* the playback zoom badge */
+  --ov-text-quiet: #9aa0a8; /* quieter words over the picture; a tile's idle dot */
+  --ov-dot-off: #7a8290; /* a tile's no-picture-yet dot */
+  --ov-edge-soft: rgba(0, 0, 0, .45); /* the edge round a tile's dot; the playback glass's shadow */
+  --ov-warn-text: #ffcf87; /* warning words over the picture; the map's selected marker */
+  --ov-select: rgba(59, 163, 255, .18); /* a drop target on a tile; the overview strip's window */
+  --ov-tool-bg: rgba(0, 0, 0, .6); /* the wall tile's tool buttons; the map credit */
+  --ov-tool-edge: #2a3139; /* the wall tile's tool buttons' edge */
+  --ov-chip-edge: #22262b; /* the bandwidth-easing chip's edge */
+  --ov-halo: rgba(0, 0, 0, .85); /* the halo round map camera names */
+  --ov-credit: #c9cfd6; /* the map credit's words */
+  --ov-pill: #14181d; /* a map site's badge */
+  --ov-lift: 0 6px 20px rgba(0, 0, 0, .25); /* a phone-list camera card's shadow */
+  --ov-drag-lift: 0 10px 30px rgba(0, 0, 0, .6); /* a live tile being dragged */
+  /* the playback full-screen glass bar: its two-stop fill, words, fills and lines */
+  --ov-glass-top: rgba(40, 44, 52, .55);
+  --ov-glass-bottom: rgba(18, 20, 24, .62);
+  --ov-glass-text: #f2f4f7;
+  --ov-text-muted: rgba(242, 244, 247, .7);
+  --ov-glass: rgba(255, 255, 255, .08);
+  --ov-glass-hover: rgba(255, 255, 255, .12);
+  --ov-glass-strong: rgba(255, 255, 255, .14);
+  --ov-glass-line: rgba(255, 255, 255, .16);
+  /* the timeline (playback, the wall): its tracks are dark in both themes, so these are too. Recorded,
+     NVR-only (and its stripe), motion event, motion-search hit, bookmark, the recorder's own gaps */
+  --tl-track: #1d232b;
+  --tl-rec: #2f6f9f;
+  --tl-nvr: #3f8a78;
+  --tl-nvr-stripe: #2b6559;
+  --tl-evt: #e0a030;
+  --tl-evt-hover: #f3c877; /* a clip handle under the pointer */
+  --tl-hit: #b36bff;
+  --tl-bm: #7cc4ff;
+  --tl-bm-hover: #b7ddff; /* a bookmark diamond under the pointer */
+  --tl-mark-edge: #0c1116; /* the bookmark diamond's edge */
+  --tl-playhead: var(--ov-glass-text); /* the playhead's line across the tracks (the glass's own white) */
+  --tl-pill-ink: #14171c; /* the playhead pill's lettering on the full-screen glass */
+  --tl-gap: #d9534f;
+  --tl-unknown: rgba(138, 147, 160, .15); /* the stripes of a wall lane the server has no index for */
+  /* video and timeline only: the corners and type sizes those surfaces have always had */
+  --r-2xs: 2px; /* timeline boxes, timeline and chart legend keys, the search progress bar */
+  --r-tl: 3px; /* the overview strip and its window, the hover label, clip handles, wall tile tools */
+  --r-xs: 4px; /* tiles, the timeline, badges and the stats box on a tile */
+  --r-preview: 8px; /* the camera editor's live preview */
+  --r-ov: 12px; /* the phone's buttons and note over the full-size camera */
+  --r-glass: 16px; /* the playback glass bar and panels; phone-list camera cards */
+  --fs-tiny: 11px; /* video overlays and map labels only: badges, stats, ticks, lane names */
+  --fs-ov-icon: 20px; /* the phone full-screen button's glyph */
+  --fs-ov-step: 30px; /* the step arrows' glyph */
+  /* warning and error words on a panel (notices, form errors): pale on dark, deep on light */
+  --warn-text: #ffcf87;
+  --bad-text: #ff8a8a;
+  /* a floating card or popover lifted off the page */
+  --shadow-pop: 0 8px 28px rgba(0, 0, 0, 0.45);
+  /* white paper behind a QR code, which needs a light quiet zone to scan in either theme */
+  --paper: #ffffff;
+
+  /* The old style.css still styles most page bodies and names its colours --panel, --muted, --tile
+     and --offline. Pointing those names at the new tokens here, at higher specificity than its own
+     :root, makes the old pages follow the palette and the light/dark switch until each is rebuilt. */
+  --panel: var(--surface-1);
+  --muted: var(--text-muted);
+  --tile: var(--video-bg);
+  --offline: var(--text-faint);
+
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px;
+  --r-sm: 6px; --r-md: 10px; --r-lg: 14px;
+  --fs-meta: 12px; --fs-dense: 13px; --fs-body: 14px; --fs-section: 16px; --fs-title: 24px; --fs-figure: 28px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --t-fast: 120ms ease;
+  --shell-w: 232px; --rail-w: 64px; --bar-h: 64px;
+}
+
+html:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f5f7;
+  --surface-1: #ffffff;
+  --surface-2: #f7f8fa;
+  --surface-3: #eaf1ff;
+  --surface-hover: #eef0f3;
+  --border: #e3e6ea;
+  --text: #16181b;
+  --text-muted: #4b5260;
+  --text-faint: #8a919c;
+  /* the edge of a text field, select or text box (see the dark block) */
+  --field-border: #8a919c;
+  --accent: #1e56d6;
+  --accent-strong: #1e56d6;
+  --accent-soft: rgba(30, 86, 214, 0.1);
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.08);
+  --focus: #1e56d6;
+  --ok-text: #166534;
+  --warn-text: #92400e;
+  --bad-text: #b91c1c;
+  --shadow-pop: 0 8px 28px rgba(16, 24, 40, 0.16);
+  --paper: #ffffff;
+  /* over the picture and on the timeline: the same in light (see the dark block), said again here */
+  --ov-shade: rgba(0, 0, 0, .75);
+  --ov-live: rgba(21, 128, 61, .92);
+  --ov-badge-bg: rgba(20, 22, 26, .55);
+  --ov-bg-faint: rgba(20, 22, 26, .45);
+  --ov-step-bg: rgba(20, 22, 26, .35);
+  --ov-step-text: rgba(255, 255, 255, .85);
+  --ov-note-bg: rgba(0, 0, 0, .72);
+  --ov-note-glass: rgba(20, 22, 26, .75);
+  --ov-stats-bg: rgba(0, 0, 0, .7);
+  --ov-stats: #b9f5c9;
+  --ov-ring: rgba(255, 255, 255, .2);
+  --ov-label: #eceef1;
+  --ov-label-quiet: #c4c8ce;
+  --ov-badge-text: #e6e8eb;
+  --ov-text-quiet: #9aa0a8;
+  --ov-dot-off: #7a8290;
+  --ov-edge-soft: rgba(0, 0, 0, .45);
+  --ov-warn-text: #ffcf87;
+  --ov-select: rgba(59, 163, 255, .18);
+  --ov-tool-bg: rgba(0, 0, 0, .6);
+  --ov-tool-edge: #2a3139;
+  --ov-chip-edge: #22262b;
+  --ov-halo: rgba(0, 0, 0, .85);
+  --ov-credit: #c9cfd6;
+  --ov-pill: #14181d;
+  --ov-lift: 0 6px 20px rgba(0, 0, 0, .25);
+  --ov-drag-lift: 0 10px 30px rgba(0, 0, 0, .6);
+  --ov-glass-top: rgba(40, 44, 52, .55);
+  --ov-glass-bottom: rgba(18, 20, 24, .62);
+  --ov-glass-text: #f2f4f7;
+  --ov-text-muted: rgba(242, 244, 247, .7);
+  --ov-glass: rgba(255, 255, 255, .08);
+  --ov-glass-hover: rgba(255, 255, 255, .12);
+  --ov-glass-strong: rgba(255, 255, 255, .14);
+  --ov-glass-line: rgba(255, 255, 255, .16);
+  --tl-track: #1d232b;
+  --tl-rec: #2f6f9f;
+  --tl-nvr: #3f8a78;
+  --tl-nvr-stripe: #2b6559;
+  --tl-evt: #e0a030;
+  --tl-evt-hover: #f3c877;
+  --tl-hit: #b36bff;
+  --tl-bm: #7cc4ff;
+  --tl-bm-hover: #b7ddff;
+  --tl-mark-edge: #0c1116;
+  --tl-playhead: var(--ov-glass-text);
+  --tl-pill-ink: #14171c;
+  --tl-gap: #d9534f;
+  --tl-unknown: rgba(138, 147, 160, .15);
+  --r-2xs: 2px;
+  --r-tl: 3px;
+  --r-xs: 4px;
+  --r-preview: 8px;
+  --r-ov: 12px;
+  --r-glass: 16px;
+  --fs-tiny: 11px;
+  --fs-ov-icon: 20px;
+  --fs-ov-step: 30px;
+}
+
+@media (prefers-reduced-motion: reduce) { html:root { --t-fast: 0ms linear; } }
