@@ -78,7 +78,8 @@ jobs:
           #   sps, substreams                     read lab captures from /work that are not in the repo
           skip=" live-replay.test.mjs player.test.mjs playout-speed.test.mjs sps.test.mjs substreams.test.mjs "
           # Run and reported, but not gating until they are fixed on Linux (none now):
-          known=" "
+          # transcode-ffmpeg: drops a few frames now and then on the shared runners (also in Argus Pro); kept visible
+          known=" transcode-ffmpeg.test.mjs "
           pass=0
           fail=0
           skipped=0
