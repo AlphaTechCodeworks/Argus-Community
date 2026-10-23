@@ -9,6 +9,10 @@ Eye in Cloud) and have outgrown the recorder's own web page and the vendor's Win
 than one recorder, more than one site, staff who need different levels of access, and a need to
 find and hand over footage quickly.
 
+**Cameras from other makers:** Hikvision, Dahua and other ONVIF cameras work in Argus when they are
+connected to a TVT-made NVR (the recorder brings them in, and Argus shows, records and plays them
+back like any other camera). Adding single IP cameras directly, without a recorder, is planned.
+
 It began as a fork of [2BAD/tvt](https://github.com/2BAD/tvt), a TypeScript SDK for talking to TVT
 devices, and has since grown into a complete application: about 77,000 lines of server and page
 code and 200 test files. The SDK is still here in `source/` ([docs/SDK.md](docs/SDK.md)); the
@@ -245,6 +249,7 @@ Other protections:
 - **Disk:** only if Argus keeps its own recordings; otherwise the NVRs' disks are used.
 - **Browsers:** a current Chrome or Edge is best. H.265 in the browser needs a PC that can decode
   it; without that, Argus converts to H.264 as described above.
+- **Cameras:** any camera the NVR accepts, including Hikvision, Dahua and other ONVIF cameras.
 - **NVRs:** TVT-made recorders with the device network port open (6036 by default) for access by
   address, or their cloud setting on for access by serial number.
 
