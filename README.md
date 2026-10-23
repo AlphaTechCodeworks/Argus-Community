@@ -11,7 +11,14 @@ find and hand over footage quickly.
 
 **Cameras from other makers:** Hikvision, Dahua and other ONVIF cameras work in Argus when they are
 connected to a TVT-made NVR (the recorder brings them in, and Argus shows, records and plays them
-back like any other camera). Adding single IP cameras directly, without a recorder, is planned.
+back like any other camera).
+
+**Hikvision directly (early support):** Hikvision recorders and cameras can also be added on their own,
+by address or from Find devices, for live view. Playback, settings and alarms from Hikvision devices
+are not done yet. It needs Hikvision's own Device Network SDK (HCNetSDK), which is not in this
+repository: download it from Hikvision and install it with `deploy/install-hcnetsdk.sh`.
+
+Adding any IP camera directly (Dahua, ONVIF and others), with recording and playback, is planned.
 
 It began as a fork of [2BAD/tvt](https://github.com/2BAD/tvt), a TypeScript SDK for talking to TVT
 devices, and has since grown into a complete application: about 77,000 lines of server and page
@@ -249,7 +256,8 @@ Other protections:
 - **Disk:** only if Argus keeps its own recordings; otherwise the NVRs' disks are used.
 - **Browsers:** a current Chrome or Edge is best. H.265 in the browser needs a PC that can decode
   it; without that, Argus converts to H.264 as described above.
-- **Cameras:** any camera the NVR accepts, including Hikvision, Dahua and other ONVIF cameras.
+- **Cameras:** any camera the NVR accepts, including Hikvision, Dahua and other ONVIF cameras; Hikvision
+  recorders and cameras can also be added directly for live view (needs Hikvision's HCNetSDK).
 - **NVRs:** TVT-made recorders with the device network port open (6036 by default) for access by
   address, or their cloud setting on for access by serial number.
 
